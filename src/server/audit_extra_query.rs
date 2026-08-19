@@ -32,32 +32,13 @@ pub struct AuditExtraSearchRequest {
 
 impl AuditExtraSearchRequest {
     pub fn normalized(mut self) -> anyhow::Result<Self> {
-        anyhow::ensure!(self.project_id > 0, "project_id 必须是正整数");
-        anyhow::ensure!(
-            self.activity_period_id > 0,
-            "activity_period_id 必须是正整数"
-        );
-        anyhow::ensure!(
-            !self.conditions.is_empty(),
-            "conditions 至少需要一个键值条件"
-        );
-        anyhow::ensure!(
-            self.conditions.len() <= MAX_CONDITIONS,
-            "conditions 最多允许 {MAX_CONDITIONS} 个键值条件"
-        );
-        for key in self.conditions.keys() {
-            anyhow::ensure!(!key.trim().is_empty(), "conditions 中的 key 不能为空");
-            anyhow::ensure!(key == key.trim(), "conditions 中的 key 不能包含首尾空白");
-            anyhow::ensure!(
-                key.chars().count() <= MAX_KEY_LENGTH,
-                "conditions 中的 key 不能超过 {MAX_KEY_LENGTH} 个字符"
-            );
-        }
-
-        self.audit_result = self
-            .audit_result
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty());
+        validate_scope_and_conditions(
+            self.project_id,
+            self.activity_period_id,
+            &self.conditions,
+            true,
+        )?;
+        normalize_audit_result(&mut self.audit_result);
         self.limit = Some(self.limit());
         self.offset = Some(self.offset());
         Ok(self)
@@ -74,24 +55,69 @@ impl AuditExtraSearchRequest {
     }
 
     fn conditions_json(&self) -> Value {
-        json!(self.conditions)
+        conditions_json(&self.conditions)
     }
 
     /// 复杂 JSON 条件仍使用 GIN 做候选预筛；字符串、数字、布尔和 null
     /// 需要兼容历史飞书 `{ type, value }` 包装，因此只做逻辑值比较。
     fn indexable_conditions_json(&self) -> Value {
-        json!(
-            self.conditions
-                .iter()
-                .filter(|(_, value)| value.is_array() || value.is_object())
-                .collect::<BTreeMap<_, _>>()
-        )
+        indexable_conditions_json(&self.conditions)
     }
 
     /// 敏感条件不进入查询缓存，避免条件值出现在内存缓存键中。
     pub fn contains_sensitive_condition(&self) -> bool {
-        self.conditions.contains_key(SENSITIVE_AUDIT_EXTRA_KEY)
+        contains_sensitive_condition(&self.conditions)
     }
+}
+
+fn validate_scope_and_conditions(
+    project_id: i64,
+    activity_period_id: i64,
+    conditions: &BTreeMap<String, Value>,
+    require_condition: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(project_id > 0, "project_id 必须是正整数");
+    anyhow::ensure!(activity_period_id > 0, "activity_period_id 必须是正整数");
+    if require_condition {
+        anyhow::ensure!(!conditions.is_empty(), "conditions 至少需要一个键值条件");
+    }
+    anyhow::ensure!(
+        conditions.len() <= MAX_CONDITIONS,
+        "conditions 最多允许 {MAX_CONDITIONS} 个键值条件"
+    );
+    for key in conditions.keys() {
+        anyhow::ensure!(!key.trim().is_empty(), "conditions 中的 key 不能为空");
+        anyhow::ensure!(key == key.trim(), "conditions 中的 key 不能包含首尾空白");
+        anyhow::ensure!(
+            key.chars().count() <= MAX_KEY_LENGTH,
+            "conditions 中的 key 不能超过 {MAX_KEY_LENGTH} 个字符"
+        );
+    }
+    Ok(())
+}
+
+fn normalize_audit_result(audit_result: &mut Option<String>) {
+    *audit_result = audit_result
+        .take()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+}
+
+fn conditions_json(conditions: &BTreeMap<String, Value>) -> Value {
+    json!(conditions)
+}
+
+fn indexable_conditions_json(conditions: &BTreeMap<String, Value>) -> Value {
+    json!(
+        conditions
+            .iter()
+            .filter(|(_, value)| value.is_array() || value.is_object())
+            .collect::<BTreeMap<_, _>>()
+    )
+}
+
+fn contains_sensitive_condition(conditions: &BTreeMap<String, Value>) -> bool {
+    conditions.contains_key(SENSITIVE_AUDIT_EXTRA_KEY)
 }
 
 /// 实际命中的项目和期次。
@@ -232,6 +258,148 @@ pub struct AuditExtraSearchResponse {
     pub videos: AuditExtraPageDto<AuditExtraVideoDto>,
     /// 视频与直播独立分页，使用相同的 limit/offset。
     pub live_sessions: AuditExtraPageDto<AuditExtraLiveSessionDto>,
+}
+
+/// 按 UID 加权平均 ACU 门槛汇总直播 PV 的请求。
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct WeightedAcuLivePvRequest {
+    /// 主项目 ID，必须与 activity_period_id 的所属项目一致。
+    pub project_id: i64,
+    /// 活动期次 ID。历史期次也允许查询。
+    pub activity_period_id: i64,
+    /// 可选 audit_extra 精确条件，多个条件使用 AND；空对象表示不过滤 audit_extra。
+    /// 顶层字段名 `key` 可以参与筛选，但不会在响应或缓存中出现。
+    #[serde(default)]
+    pub conditions: BTreeMap<String, Value>,
+    /// 可选审核结果精确匹配，如“审核通过”或“不通过”。
+    pub audit_result: Option<String>,
+    /// 严格小于该值的 UID 会被选中。例如 10 表示 weighted_average_acu < 10。
+    pub weighted_average_acu_lt: f64,
+}
+
+impl WeightedAcuLivePvRequest {
+    pub fn normalized(mut self) -> anyhow::Result<Self> {
+        validate_scope_and_conditions(
+            self.project_id,
+            self.activity_period_id,
+            &self.conditions,
+            false,
+        )?;
+        anyhow::ensure!(
+            self.weighted_average_acu_lt.is_finite(),
+            "weighted_average_acu_lt 必须是有限数字"
+        );
+        anyhow::ensure!(
+            self.weighted_average_acu_lt >= 0.0,
+            "weighted_average_acu_lt 不能小于 0"
+        );
+        normalize_audit_result(&mut self.audit_result);
+        Ok(self)
+    }
+
+    pub fn contains_sensitive_condition(&self) -> bool {
+        contains_sensitive_condition(&self.conditions)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct WeightedAcuLivePvFiltersDto {
+    /// 已标准化的公开 audit_extra 条件；顶层机密字段 `key` 不回显。
+    pub conditions: BTreeMap<String, Value>,
+    pub audit_result: Option<String>,
+    /// UID 加权平均 ACU 的严格上界。
+    pub weighted_average_acu_lt: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct WeightedAcuLivePvSummaryDto {
+    /// audit_extra、审核结果和期次范围内，具有非空 anchor_uid 的 UID 数量。
+    pub candidate_user_count: i64,
+    /// 至少有一场同时具备 ACU 且直播时长大于 0，可计算加权平均 ACU 的 UID 数量。
+    pub evaluated_user_count: i64,
+    /// 加权平均 ACU 严格低于门槛的 UID 数量。
+    pub selected_user_count: i64,
+    /// 所有选中 UID 在筛选范围内的直播场次数；包括该 UID 缺少 ACU/有效时长的其他场次。
+    pub selected_live_session_count: i64,
+    /// 所有选中 UID 在筛选范围内的 live_exposure_pv 总和；空值按 0。
+    pub total_live_exposure_pv: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct WeightedAcuLivePvResponse {
+    pub ok: bool,
+    pub scope: AuditExtraScopeDto,
+    pub filters: WeightedAcuLivePvFiltersDto,
+    pub summary: WeightedAcuLivePvSummaryDto,
+}
+
+/// 按 UID 视频总播放门槛汇总播放量的请求。
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct AuthorPlayVideoTotalRequest {
+    /// 主项目 ID，必须与 activity_period_id 的所属项目一致。
+    pub project_id: i64,
+    /// 活动期次 ID。历史期次也允许查询。
+    pub activity_period_id: i64,
+    /// 可选 audit_extra 精确条件，多个条件使用 AND；空对象表示不过滤 audit_extra。
+    /// 顶层字段名 `key` 可以参与筛选，但不会在响应或缓存中出现。
+    #[serde(default)]
+    pub conditions: BTreeMap<String, Value>,
+    /// 可选审核结果精确匹配，如“审核通过”或“不通过”。
+    pub audit_result: Option<String>,
+    /// 严格小于该值的 UID 会被选中。例如 100000 表示 author_total_play_count < 100000。
+    pub author_total_play_count_lt: i64,
+}
+
+impl AuthorPlayVideoTotalRequest {
+    pub fn normalized(mut self) -> anyhow::Result<Self> {
+        validate_scope_and_conditions(
+            self.project_id,
+            self.activity_period_id,
+            &self.conditions,
+            false,
+        )?;
+        anyhow::ensure!(
+            self.author_total_play_count_lt >= 0,
+            "author_total_play_count_lt 不能小于 0"
+        );
+        normalize_audit_result(&mut self.audit_result);
+        Ok(self)
+    }
+
+    pub fn contains_sensitive_condition(&self) -> bool {
+        contains_sensitive_condition(&self.conditions)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct AuthorPlayVideoTotalFiltersDto {
+    /// 已标准化的公开 audit_extra 条件；顶层机密字段 `key` 不回显。
+    pub conditions: BTreeMap<String, Value>,
+    pub audit_result: Option<String>,
+    /// UID 视频总播放的严格上界。
+    pub author_total_play_count_lt: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct AuthorPlayVideoTotalSummaryDto {
+    /// audit_extra、审核结果和期次范围内，具有非空 author_uid 的 UID 数量。
+    pub candidate_user_count: i64,
+    /// 视频最新播放量合计严格低于门槛的 UID 数量。
+    pub selected_user_count: i64,
+    /// 所有选中 UID 在筛选范围内的视频数量。
+    pub selected_video_count: i64,
+    /// 选中视频中至少存在一个 video_daily_metric 快照的视频数量。
+    pub selected_video_with_metric_count: i64,
+    /// 所有选中 UID 的视频最新 play_count 总和；无指标或空值按 0。
+    pub total_play_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct AuthorPlayVideoTotalResponse {
+    pub ok: bool,
+    pub scope: AuditExtraScopeDto,
+    pub filters: AuthorPlayVideoTotalFiltersDto,
+    pub summary: AuthorPlayVideoTotalSummaryDto,
 }
 
 /// 按项目、期次和一个或多个 audit_extra 键值精确查询视频与直播。
@@ -516,6 +684,295 @@ pub async fn search(
     }))
 }
 
+/// 在 audit_extra/审核结果筛选范围内，按 anchor_uid 计算时长加权平均 ACU，
+/// 选出严格低于门槛的 UID，再汇总这些 UID 的全部直播场观 PV。
+pub async fn total_live_pv_below_weighted_acu(
+    pool: &PgPool,
+    request: WeightedAcuLivePvRequest,
+) -> anyhow::Result<Option<WeightedAcuLivePvResponse>> {
+    let request = request.normalized()?;
+    let audit_result = request.audit_result.clone();
+    let conditions = Json(conditions_json(&request.conditions));
+    let indexable_conditions = Json(indexable_conditions_json(&request.conditions));
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+
+    let scope_row = sqlx::query(
+        r#"
+        SELECT
+            project.project_id,
+            project.project_key,
+            project.display_name AS project_display_name,
+            period.activity_period_id,
+            period.period,
+            period.period_code
+        FROM xingtu_project project
+        JOIN xingtu_activity_period period ON period.project_id = project.project_id
+        WHERE project.project_id = $1 AND period.activity_period_id = $2
+        "#,
+    )
+    .bind(request.project_id)
+    .bind(request.activity_period_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(scope_row) = scope_row else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    let scope = AuditExtraScopeDto {
+        project_id: scope_row.try_get("project_id")?,
+        project_key: scope_row.try_get("project_key")?,
+        project_display_name: scope_row.try_get("project_display_name")?,
+        activity_period_id: scope_row.try_get("activity_period_id")?,
+        period: scope_row.try_get("period")?,
+        period_code: scope_row.try_get("period_code")?,
+    };
+
+    let row = sqlx::query(
+        r#"
+        WITH candidate_lives AS (
+            SELECT
+                NULLIF(btrim(live.anchor_uid), '') AS user_uid,
+                live.live_exposure_pv,
+                live.acu::float8 AS acu,
+                live.live_duration_seconds
+            FROM live_session live
+            JOIN xingtu_activity_content_config config
+                ON config.content_config_id = live.content_config_id
+            JOIN xingtu_activity_period period
+                ON period.activity_period_id = config.activity_period_id
+            WHERE period.project_id = $1
+                AND period.activity_period_id = $2
+                AND config.content_type = 'live'
+                AND NULLIF(btrim(live.anchor_uid), '') IS NOT NULL
+                AND live.audit_extra @> $5::jsonb
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM jsonb_each($3::jsonb) AS condition(key, value)
+                    WHERE normalize_audit_extra_field_value(
+                        live.audit_extra -> condition.key
+                    ) IS DISTINCT FROM condition.value
+                )
+                AND ($4::text IS NULL OR live.audit_result = $4)
+        ),
+        user_metrics AS (
+            SELECT
+                user_uid,
+                SUM(
+                    CASE
+                        WHEN acu IS NOT NULL AND live_duration_seconds > 0
+                        THEN acu * live_duration_seconds::float8
+                    END
+                ) / NULLIF(
+                    SUM(
+                        CASE
+                            WHEN acu IS NOT NULL AND live_duration_seconds > 0
+                            THEN live_duration_seconds::float8
+                        END
+                    ),
+                    0
+                ) AS weighted_average_acu
+            FROM candidate_lives
+            GROUP BY user_uid
+        ),
+        selected_users AS (
+            SELECT user_uid
+            FROM user_metrics
+            WHERE weighted_average_acu < $6::float8
+        ),
+        selected_lives AS (
+            SELECT candidate.live_exposure_pv
+            FROM candidate_lives candidate
+            JOIN selected_users selected USING (user_uid)
+        )
+        SELECT
+            (SELECT COUNT(*) FROM user_metrics)::bigint AS candidate_user_count,
+            (SELECT COUNT(weighted_average_acu) FROM user_metrics)::bigint
+                AS evaluated_user_count,
+            (SELECT COUNT(*) FROM selected_users)::bigint AS selected_user_count,
+            (SELECT COUNT(*) FROM selected_lives)::bigint AS selected_live_session_count,
+            (
+                SELECT COALESCE(SUM(COALESCE(live_exposure_pv, 0)), 0)::bigint
+                FROM selected_lives
+            ) AS total_live_exposure_pv
+        "#,
+    )
+    .bind(request.project_id)
+    .bind(request.activity_period_id)
+    .bind(&conditions)
+    .bind(&audit_result)
+    .bind(&indexable_conditions)
+    .bind(request.weighted_average_acu_lt)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(Some(WeightedAcuLivePvResponse {
+        ok: true,
+        scope,
+        filters: WeightedAcuLivePvFiltersDto {
+            conditions: redact_condition_map(request.conditions),
+            audit_result,
+            weighted_average_acu_lt: request.weighted_average_acu_lt,
+        },
+        summary: WeightedAcuLivePvSummaryDto {
+            candidate_user_count: row.try_get("candidate_user_count")?,
+            evaluated_user_count: row.try_get("evaluated_user_count")?,
+            selected_user_count: row.try_get("selected_user_count")?,
+            selected_live_session_count: row.try_get("selected_live_session_count")?,
+            total_live_exposure_pv: row.try_get("total_live_exposure_pv")?,
+        },
+    }))
+}
+
+/// 在 audit_extra/审核结果筛选范围内，每个视频只取最新指标，按 author_uid
+/// 汇总播放量，选出严格低于门槛的 UID，再返回这些 UID 的播放量合计。
+pub async fn total_video_play_below_author_total(
+    pool: &PgPool,
+    request: AuthorPlayVideoTotalRequest,
+) -> anyhow::Result<Option<AuthorPlayVideoTotalResponse>> {
+    let request = request.normalized()?;
+    let audit_result = request.audit_result.clone();
+    let conditions = Json(conditions_json(&request.conditions));
+    let indexable_conditions = Json(indexable_conditions_json(&request.conditions));
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+
+    let scope_row = sqlx::query(
+        r#"
+        SELECT
+            project.project_id,
+            project.project_key,
+            project.display_name AS project_display_name,
+            period.activity_period_id,
+            period.period,
+            period.period_code
+        FROM xingtu_project project
+        JOIN xingtu_activity_period period ON period.project_id = project.project_id
+        WHERE project.project_id = $1 AND period.activity_period_id = $2
+        "#,
+    )
+    .bind(request.project_id)
+    .bind(request.activity_period_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(scope_row) = scope_row else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    let scope = AuditExtraScopeDto {
+        project_id: scope_row.try_get("project_id")?,
+        project_key: scope_row.try_get("project_key")?,
+        project_display_name: scope_row.try_get("project_display_name")?,
+        activity_period_id: scope_row.try_get("activity_period_id")?,
+        period: scope_row.try_get("period")?,
+        period_code: scope_row.try_get("period_code")?,
+    };
+
+    let row = sqlx::query(
+        r#"
+        WITH candidate_videos AS (
+            SELECT
+                video.content_config_id,
+                video.video_id,
+                NULLIF(btrim(video.author_uid), '') AS user_uid
+            FROM video_content video
+            JOIN xingtu_activity_content_config config
+                ON config.content_config_id = video.content_config_id
+            JOIN xingtu_activity_period period
+                ON period.activity_period_id = config.activity_period_id
+            WHERE period.project_id = $1
+                AND period.activity_period_id = $2
+                AND config.content_type = 'video'
+                AND NULLIF(btrim(video.author_uid), '') IS NOT NULL
+                AND video.audit_extra @> $5::jsonb
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM jsonb_each($3::jsonb) AS condition(key, value)
+                    WHERE normalize_audit_extra_field_value(
+                        video.audit_extra -> condition.key
+                    ) IS DISTINCT FROM condition.value
+                )
+                AND ($4::text IS NULL OR video.audit_result = $4)
+        ),
+        latest_video_metrics AS (
+            SELECT
+                candidate.user_uid,
+                COALESCE(metric.play_count, 0)::bigint AS play_count,
+                metric.stat_date IS NOT NULL AS has_metric
+            FROM candidate_videos candidate
+            LEFT JOIN LATERAL (
+                SELECT daily.stat_date, daily.play_count
+                FROM video_daily_metric daily
+                WHERE daily.content_config_id = candidate.content_config_id
+                    AND daily.video_id = candidate.video_id
+                ORDER BY daily.stat_date DESC, daily.imported_at DESC
+                LIMIT 1
+            ) metric ON true
+        ),
+        user_totals AS (
+            SELECT
+                user_uid,
+                COUNT(*)::bigint AS video_count,
+                COUNT(*) FILTER (WHERE has_metric)::bigint AS video_with_metric_count,
+                SUM(play_count)::bigint AS total_play_count
+            FROM latest_video_metrics
+            GROUP BY user_uid
+        ),
+        selected_users AS (
+            SELECT user_uid, video_count, video_with_metric_count, total_play_count
+            FROM user_totals
+            WHERE total_play_count < $6::bigint
+        )
+        SELECT
+            (SELECT COUNT(*) FROM user_totals)::bigint AS candidate_user_count,
+            (SELECT COUNT(*) FROM selected_users)::bigint AS selected_user_count,
+            (
+                SELECT COALESCE(SUM(video_count), 0)::bigint
+                FROM selected_users
+            ) AS selected_video_count,
+            (
+                SELECT COALESCE(SUM(video_with_metric_count), 0)::bigint
+                FROM selected_users
+            ) AS selected_video_with_metric_count,
+            (
+                SELECT COALESCE(SUM(total_play_count), 0)::bigint
+                FROM selected_users
+            ) AS total_play_count
+        "#,
+    )
+    .bind(request.project_id)
+    .bind(request.activity_period_id)
+    .bind(&conditions)
+    .bind(&audit_result)
+    .bind(&indexable_conditions)
+    .bind(request.author_total_play_count_lt)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(Some(AuthorPlayVideoTotalResponse {
+        ok: true,
+        scope,
+        filters: AuthorPlayVideoTotalFiltersDto {
+            conditions: redact_condition_map(request.conditions),
+            audit_result,
+            author_total_play_count_lt: request.author_total_play_count_lt,
+        },
+        summary: AuthorPlayVideoTotalSummaryDto {
+            candidate_user_count: row.try_get("candidate_user_count")?,
+            selected_user_count: row.try_get("selected_user_count")?,
+            selected_video_count: row.try_get("selected_video_count")?,
+            selected_video_with_metric_count: row.try_get("selected_video_with_metric_count")?,
+            total_play_count: row.try_get("total_play_count")?,
+        },
+    }))
+}
+
 fn video_from_row(row: sqlx::postgres::PgRow) -> Result<AuditExtraVideoDto, sqlx::Error> {
     let stat_date: Option<NaiveDate> = row.try_get("stat_date")?;
     let latest_metric = stat_date
@@ -726,6 +1183,49 @@ mod tests {
                 "array": [1, 2],
                 "object": { "a": 1 }
             })
+        );
+    }
+
+    #[test]
+    fn threshold_requests_allow_whole_period_and_validate_bounds() {
+        let live = WeightedAcuLivePvRequest {
+            project_id: 1,
+            activity_period_id: 2,
+            conditions: BTreeMap::new(),
+            audit_result: Some(" 审核通过 ".to_owned()),
+            weighted_average_acu_lt: 10.0,
+        }
+        .normalized()
+        .unwrap();
+        assert_eq!(live.audit_result.as_deref(), Some("审核通过"));
+        assert!(!live.contains_sensitive_condition());
+
+        let video = AuthorPlayVideoTotalRequest {
+            project_id: 1,
+            activity_period_id: 2,
+            conditions: BTreeMap::from([("key".to_owned(), json!("secret"))]),
+            audit_result: None,
+            author_total_play_count_lt: 100_000,
+        }
+        .normalized()
+        .unwrap();
+        assert!(video.contains_sensitive_condition());
+
+        assert!(
+            WeightedAcuLivePvRequest {
+                weighted_average_acu_lt: -0.1,
+                ..live
+            }
+            .normalized()
+            .is_err()
+        );
+        assert!(
+            AuthorPlayVideoTotalRequest {
+                author_total_play_count_lt: -1,
+                ..video
+            }
+            .normalized()
+            .is_err()
         );
     }
 }

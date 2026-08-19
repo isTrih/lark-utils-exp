@@ -1,5 +1,9 @@
 use chrono::NaiveDate;
-use lark_exp::server::audit_extra_query::{AuditExtraSearchRequest, search as search_audit_extra};
+use lark_exp::server::audit_extra_query::{
+    AuditExtraSearchRequest, AuthorPlayVideoTotalRequest, WeightedAcuLivePvRequest,
+    search as search_audit_extra, total_live_pv_below_weighted_acu,
+    total_video_play_below_author_total,
+};
 use lark_exp::server::cache::QueryCache;
 use lark_exp::server::query::{
     OperationalContentQuery, VideoAnalyticsQuery, VideoGrowthQuery, VideoLabelSummaryQuery,
@@ -412,6 +416,77 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        r#"
+        INSERT INTO video_content (
+            content_config_id, video_id, publish_time, author_name, author_uid,
+            title, audit_result, label, audit_extra
+        ) VALUES
+            ($1, 'threshold-video-low-a', TIMESTAMP '2026-08-11 10:00:00',
+                '阈值作者甲', 'threshold-author-low', '低播放一', '审核通过', '阈值测试', $2),
+            ($1, 'threshold-video-low-b', TIMESTAMP '2026-08-11 11:00:00',
+                '阈值作者甲', 'threshold-author-low', '低播放二', '审核通过', '阈值测试', $2),
+            ($1, 'threshold-video-high', TIMESTAMP '2026-08-11 12:00:00',
+                '阈值作者乙', 'threshold-author-high', '高播放', '审核通过', '阈值测试', $2),
+            ($1, 'threshold-video-zero', TIMESTAMP '2026-08-11 13:00:00',
+                '阈值作者丙', 'threshold-author-zero', '无指标', '审核通过', '阈值测试', $2),
+            ($1, 'threshold-video-empty-uid', TIMESTAMP '2026-08-11 14:00:00',
+                '阈值作者空', '   ', '空 UID', '审核通过', '阈值测试', $2)
+        "#,
+    )
+    .bind(content_config_id)
+    .bind(Json(json!({ "threshold_fixture": true })))
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO video_daily_metric (
+            content_config_id, feishu_source_id, stat_date, video_id, play_count
+        ) VALUES
+            ($1, $2, DATE '2026-08-11', 'threshold-video-low-a', 100),
+            ($1, $2, DATE '2026-08-11', 'threshold-video-low-b', 150),
+            ($1, $2, DATE '2026-08-12', 'threshold-video-low-b', 200),
+            ($1, $2, DATE '2026-08-11', 'threshold-video-high', 700),
+            ($1, $2, DATE '2026-08-11', 'threshold-video-empty-uid', 50)
+        "#,
+    )
+    .bind(content_config_id)
+    .bind(report_source_id)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO live_session (
+            content_config_id, feishu_source_id, live_room_id, start_time,
+            anchor_name, anchor_uid, title, live_exposure_pv, acu,
+            live_duration_seconds, audit_result, audit_extra
+        ) VALUES
+            ($1, $2, 'threshold-live-low-a', TIMESTAMP '2026-08-11 10:00:00',
+                '阈值主播甲', 'threshold-anchor-low', '低 ACU 一', 100, 5, 3600,
+                '审核通过', $3),
+            ($1, $2, 'threshold-live-low-b', TIMESTAMP '2026-08-11 11:00:00',
+                '阈值主播甲', 'threshold-anchor-low', '低 ACU 二', 200, 15, 1800,
+                '审核通过', $3),
+            ($1, $2, 'threshold-live-low-missing', TIMESTAMP '2026-08-11 12:00:00',
+                '阈值主播甲', 'threshold-anchor-low', '缺 ACU 仍计 PV', 50, NULL, 600,
+                '审核通过', $3),
+            ($1, $2, 'threshold-live-high', TIMESTAMP '2026-08-11 13:00:00',
+                '阈值主播乙', 'threshold-anchor-high', '高 ACU', 400, 20, 3600,
+                '审核通过', $3),
+            ($1, $2, 'threshold-live-unknown', TIMESTAMP '2026-08-11 14:00:00',
+                '阈值主播丙', 'threshold-anchor-unknown', '无法计算', 500, NULL, 3600,
+                '审核通过', $3),
+            ($1, $2, 'threshold-live-empty-uid', TIMESTAMP '2026-08-11 15:00:00',
+                '阈值主播空', ' ', '空 UID', 600, 1, 3600, '审核通过', $3)
+        "#,
+    )
+    .bind(live_content_config_id)
+    .bind(live_source_id)
+    .bind(Json(json!({ "threshold_fixture": true })))
+    .execute(&pool)
+    .await?;
+
     let legacy_video_extra: Json<serde_json::Value> = sqlx::query_scalar(
         "SELECT audit_extra FROM video_content WHERE content_config_id = $1 AND video_id = 'video-e'",
     )
@@ -669,6 +744,70 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
         .await?
         .is_none()
     );
+
+    let low_acu_live_pv = total_live_pv_below_weighted_acu(
+        &pool,
+        WeightedAcuLivePvRequest {
+            project_id,
+            activity_period_id,
+            conditions: BTreeMap::from([("threshold_fixture".to_owned(), json!(true))]),
+            audit_result: Some("审核通过".to_owned()),
+            weighted_average_acu_lt: 10.0,
+        },
+    )
+    .await?
+    .expect("project-period scope should exist");
+    assert_eq!(low_acu_live_pv.summary.candidate_user_count, 3);
+    assert_eq!(low_acu_live_pv.summary.evaluated_user_count, 2);
+    assert_eq!(low_acu_live_pv.summary.selected_user_count, 1);
+    assert_eq!(low_acu_live_pv.summary.selected_live_session_count, 3);
+    assert_eq!(low_acu_live_pv.summary.total_live_exposure_pv, 350);
+    assert_eq!(low_acu_live_pv.filters.weighted_average_acu_lt, 10.0);
+
+    let low_play_video_total = total_video_play_below_author_total(
+        &pool,
+        AuthorPlayVideoTotalRequest {
+            project_id,
+            activity_period_id,
+            conditions: BTreeMap::from([("threshold_fixture".to_owned(), json!(true))]),
+            audit_result: Some("审核通过".to_owned()),
+            author_total_play_count_lt: 500,
+        },
+    )
+    .await?
+    .expect("project-period scope should exist");
+    assert_eq!(low_play_video_total.summary.candidate_user_count, 3);
+    assert_eq!(low_play_video_total.summary.selected_user_count, 2);
+    assert_eq!(low_play_video_total.summary.selected_video_count, 3);
+    assert_eq!(
+        low_play_video_total
+            .summary
+            .selected_video_with_metric_count,
+        2
+    );
+    assert_eq!(low_play_video_total.summary.total_play_count, 300);
+
+    let sensitive_threshold_result = total_video_play_below_author_total(
+        &pool,
+        AuthorPlayVideoTotalRequest {
+            project_id,
+            activity_period_id,
+            conditions: BTreeMap::from([("key".to_owned(), json!(sensitive_audit_key))]),
+            audit_result: Some("审核通过".to_owned()),
+            author_total_play_count_lt: 200,
+        },
+    )
+    .await?
+    .unwrap();
+    assert_eq!(sensitive_threshold_result.summary.selected_user_count, 2);
+    assert_eq!(sensitive_threshold_result.summary.total_play_count, 150);
+    assert!(
+        !sensitive_threshold_result
+            .filters
+            .conditions
+            .contains_key("key")
+    );
+    assert!(!serde_json::to_string(&sensitive_threshold_result)?.contains(sensitive_audit_key));
 
     let date_from = NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
     let date_to = NaiveDate::from_ymd_opt(2026, 8, 9).unwrap();

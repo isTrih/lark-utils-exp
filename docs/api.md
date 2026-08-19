@@ -1366,6 +1366,128 @@ curl -X POST "https://api.example.com/api/v1/queries/v2/audit-extra/search" \
 
 汇总中的 `total_play_count` 是每个命中视频最新指标快照的播放量之和；`total_live_exposure_pv` 只统计直播的 `live_exposure_pv`。
 
+### `POST /api/v1/queries/v2/audit-extra/live-pv/weighted-acu-below`
+
+先在指定主项目和活动期次中应用可选的 `audit_extra` 条件与审核结果，再按非空 `anchor_uid` 聚合直播数据。每个 UID 的加权平均 ACU 计算方式为：
+
+```text
+Σ(acu × live_duration_seconds) / Σ(live_duration_seconds)
+```
+
+只有同时具有 ACU 且 `live_duration_seconds > 0` 的场次参与加权平均计算。完全没有有效 ACU/时长组合的 UID 不参与门槛判断，避免把未知数据误判为低 ACU。筛出加权平均 ACU 严格小于 `weighted_average_acu_lt` 的 UID 后，接口汇总这些 UID 在相同 `audit_extra`、审核结果和期次范围内全部场次的 `live_exposure_pv`；选中 UID 缺少 ACU 的其他场次仍计入最终 PV。
+
+`conditions` 可以省略或传 `{}`，表示不限制 `audit_extra`。顶层机密条件 `key` 仍可用于筛选，但不会在响应中回显，也不会进入查询缓存键。
+
+```bash
+curl -X POST "https://api.example.com/api/v1/queries/v2/audit-extra/live-pv/weighted-acu-below" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": 1,
+    "activity_period_id": 2,
+    "conditions": {
+      "rok_key": "ROK"
+    },
+    "audit_result": "审核通过",
+    "weighted_average_acu_lt": 10
+  }'
+```
+
+响应示例：
+
+```json
+{
+  "ok": true,
+  "scope": {
+    "project_id": 1,
+    "project_key": "rok",
+    "project_display_name": "ROK 生态",
+    "activity_period_id": 2,
+    "period": "2026年8月第十五期",
+    "period_code": "rok-2026-08-p15"
+  },
+  "filters": {
+    "conditions": {
+      "rok_key": "ROK"
+    },
+    "audit_result": "审核通过",
+    "weighted_average_acu_lt": 10.0
+  },
+  "summary": {
+    "candidate_user_count": 38,
+    "evaluated_user_count": 36,
+    "selected_user_count": 9,
+    "selected_live_session_count": 21,
+    "total_live_exposure_pv": 582100
+  }
+}
+```
+
+字段说明：
+
+- `candidate_user_count`：筛选范围内具有非空 `anchor_uid` 的 UID 数量。
+- `evaluated_user_count`：至少有一场可参与加权计算的 UID 数量。
+- `selected_user_count`：加权平均 ACU 严格低于门槛的 UID 数量。
+- `selected_live_session_count`：选中 UID 在筛选范围内的全部直播场次数。
+- `total_live_exposure_pv`：这些直播场次的业务场观 PV 总和，只使用 `live_exposure_pv`。
+
+### `POST /api/v1/queries/v2/audit-extra/video-play/author-total-below`
+
+先在指定主项目和活动期次中应用可选的 `audit_extra` 条件与审核结果，再按非空 `author_uid` 聚合视频。每条视频只取 `stat_date` 最新、同日 `imported_at` 最新的一条 `video_daily_metric`，然后将最新 `play_count` 按 UID 相加。
+
+筛出 UID 总播放量严格小于 `author_total_play_count_lt` 的用户后，接口返回这些 UID 的视频数量和总播放量。没有指标或最新 `play_count` 为空的视频按 `0` 参与聚合，因此在正数门槛下，对应 UID 也可能被选中。空 `author_uid` 不参与统计。
+
+```bash
+curl -X POST "https://api.example.com/api/v1/queries/v2/audit-extra/video-play/author-total-below" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": 1,
+    "activity_period_id": 2,
+    "conditions": {
+      "rok_key": "ROK"
+    },
+    "audit_result": "审核通过",
+    "author_total_play_count_lt": 100000
+  }'
+```
+
+响应示例：
+
+```json
+{
+  "ok": true,
+  "scope": {
+    "project_id": 1,
+    "project_key": "rok",
+    "project_display_name": "ROK 生态",
+    "activity_period_id": 2,
+    "period": "2026年8月第十五期",
+    "period_code": "rok-2026-08-p15"
+  },
+  "filters": {
+    "conditions": {
+      "rok_key": "ROK"
+    },
+    "audit_result": "审核通过",
+    "author_total_play_count_lt": 100000
+  },
+  "summary": {
+    "candidate_user_count": 143,
+    "selected_user_count": 51,
+    "selected_video_count": 126,
+    "selected_video_with_metric_count": 121,
+    "total_play_count": 1836500
+  }
+}
+```
+
+字段说明：
+
+- `candidate_user_count`：筛选范围内具有非空 `author_uid` 的 UID 数量。
+- `selected_user_count`：UID 最新视频总播放严格低于门槛的用户数量。
+- `selected_video_count`：选中 UID 在筛选范围内的视频数量。
+- `selected_video_with_metric_count`：选中视频中至少具有一个指标快照的视频数量。
+- `total_play_count`：选中 UID 的视频最新播放量总和。
+
 ## 缓存说明
 
 查询接口使用 5 分钟服务端内存缓存。缓存值是 zstd level 1 压缩后的 JSON，并按压缩后的实际

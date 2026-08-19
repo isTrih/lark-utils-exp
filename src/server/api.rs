@@ -109,6 +109,14 @@ pub fn routes() -> Router {
                 .push(Router::with_path("videos/summary").get(video_summary))
                 .push(Router::with_path("videos/top-growth").get(top_video_growth))
                 .push(Router::with_path("v2/audit-extra/search").post(search_audit_extra))
+                .push(
+                    Router::with_path("v2/audit-extra/live-pv/weighted-acu-below")
+                        .post(audit_extra_live_pv_below_weighted_acu),
+                )
+                .push(
+                    Router::with_path("v2/audit-extra/video-play/author-total-below")
+                        .post(audit_extra_video_play_below_author_total),
+                )
                 .push(Router::with_path("video-metrics").get(list_video_metrics))
                 .push(Router::with_path("video-trace-metrics").get(list_video_trace_metrics))
                 .push(Router::with_path("live-sessions").get(list_live_sessions))
@@ -866,6 +874,84 @@ async fn search_audit_extra(
     Ok(Json(data))
 }
 
+#[endpoint(
+    tags("audit-extra"),
+    summary = "汇总加权平均 ACU 低于门槛用户的直播 PV",
+    description = "只读且幂等的 POST 聚合接口。服务端先在指定主项目和活动期次内应用可选 conditions（audit_extra 多条件 AND 精确匹配）及 audit_result，再按非空 anchor_uid 聚合。每个 UID 的加权平均 ACU = Σ(acu × live_duration_seconds) / Σ(live_duration_seconds)，只有同时具备 ACU 且 live_duration_seconds > 0 的场次参与分子和分母；完全没有有效 ACU/时长的 UID 不参与门槛判断。随后选出 weighted_average_acu 严格小于 weighted_average_acu_lt 的 UID，并汇总这些 UID 在同一筛选范围内全部场次的 live_exposure_pv；选中 UID 的其他缺少 ACU/有效时长场次仍计入场次数和 PV。空 anchor_uid 不参与聚合。conditions 可省略或传空对象，表示查询整期；示例：{\"project_id\":1,\"activity_period_id\":2,\"conditions\":{\"rok_key\":\"ROK\"},\"audit_result\":\"审核通过\",\"weighted_average_acu_lt\":10}。顶层机密条件 key 可以筛选，但不回显且不会进入缓存键。业务直播 PV 只使用 live_exposure_pv。"
+)]
+async fn audit_extra_live_pv_below_weighted_acu(
+    body: RequiredJsonBody<crate::server::audit_extra_query::WeightedAcuLivePvRequest>,
+    depot: &mut Depot,
+) -> ApiResult<crate::server::audit_extra_query::WeightedAcuLivePvResponse> {
+    let filters = body
+        .into_inner()
+        .normalized()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let state = state_from_depot(depot)?;
+    let project_id = filters.project_id;
+    let activity_period_id = filters.activity_period_id;
+    let data = if filters.contains_sensitive_condition() {
+        crate::server::audit_extra_query::total_live_pv_below_weighted_acu(&state.pool, filters)
+            .await?
+    } else {
+        let key = cache_key("v2-audit-extra-live-pv-weighted-acu-below", &filters)?;
+        let cache = state.query_cache.clone();
+        let pool = state.pool.clone();
+        cache
+            .get_or_try_insert(key, || async move {
+                crate::server::audit_extra_query::total_live_pv_below_weighted_acu(&pool, filters)
+                    .await
+            })
+            .await?
+    }
+    .ok_or_else(|| {
+        ApiError::not_found(format!(
+            "主项目 {project_id} 不存在，或活动期次 {activity_period_id} 不属于该项目"
+        ))
+    })?;
+    Ok(Json(data))
+}
+
+#[endpoint(
+    tags("audit-extra"),
+    summary = "汇总视频总播放低于门槛用户的播放量",
+    description = "只读且幂等的 POST 聚合接口。服务端先在指定主项目和活动期次内应用可选 conditions（audit_extra 多条件 AND 精确匹配）及 audit_result，再按非空 author_uid 聚合。每条视频只取 stat_date 最新、同日 imported_at 最新的一条 video_daily_metric，play_count 缺失或为空按 0；每个 UID 的 author_total_play_count 是这些视频最新播放量之和。随后选出 author_total_play_count 严格小于 author_total_play_count_lt 的 UID，并返回这些 UID 的视频数量、已有指标视频数量及总播放量。没有指标但具有 author_uid 的视频按 0 参与，因此在正数门槛下对应 UID 可能被选中。空 author_uid 不参与聚合。conditions 可省略或传空对象，表示查询整期；示例：{\"project_id\":1,\"activity_period_id\":2,\"conditions\":{\"rok_key\":\"ROK\"},\"audit_result\":\"审核通过\",\"author_total_play_count_lt\":100000}。顶层机密条件 key 可以筛选，但不回显且不会进入缓存键。"
+)]
+async fn audit_extra_video_play_below_author_total(
+    body: RequiredJsonBody<crate::server::audit_extra_query::AuthorPlayVideoTotalRequest>,
+    depot: &mut Depot,
+) -> ApiResult<crate::server::audit_extra_query::AuthorPlayVideoTotalResponse> {
+    let filters = body
+        .into_inner()
+        .normalized()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let state = state_from_depot(depot)?;
+    let project_id = filters.project_id;
+    let activity_period_id = filters.activity_period_id;
+    let data = if filters.contains_sensitive_condition() {
+        crate::server::audit_extra_query::total_video_play_below_author_total(&state.pool, filters)
+            .await?
+    } else {
+        let key = cache_key("v2-audit-extra-video-play-author-total-below", &filters)?;
+        let cache = state.query_cache.clone();
+        let pool = state.pool.clone();
+        cache
+            .get_or_try_insert(key, || async move {
+                crate::server::audit_extra_query::total_video_play_below_author_total(
+                    &pool, filters,
+                )
+                .await
+            })
+            .await?
+    }
+    .ok_or_else(|| {
+        ApiError::not_found(format!(
+            "主项目 {project_id} 不存在，或活动期次 {activity_period_id} 不属于该项目"
+        ))
+    })?;
+    Ok(Json(data))
+}
+
 #[endpoint(tags("queries"), summary = "统一分页查询视频内容")]
 async fn list_videos_v2(
     filters: query::OperationalContentQuery,
@@ -984,6 +1070,8 @@ mod tests {
             "api/v1/queries/v2/live-sessions",
             "api/v1/queries/v2/feishu-sources",
             "api/v1/queries/v2/audit-extra/search",
+            "api/v1/queries/v2/audit-extra/live-pv/weighted-acu-below",
+            "api/v1/queries/v2/audit-extra/video-play/author-total-below",
         ] {
             assert!(
                 openapi.paths.contains_key(path),
@@ -1010,6 +1098,10 @@ mod tests {
             "rok_key",
             "audit_extra 顶层字段名 key 是机密扩展项",
             "调用方只需传业务值，不要传富文本包装",
+            "Σ(acu × live_duration_seconds) / Σ(live_duration_seconds)",
+            "weighted_average_acu_lt",
+            "author_total_play_count_lt",
+            "没有指标但具有 author_uid 的视频按 0 参与",
         ] {
             assert!(
                 document.contains(expected),
@@ -1035,6 +1127,39 @@ mod tests {
         let body = response.take_json::<Value>().await.unwrap();
         assert_eq!(body["code"], "bad_request");
         assert!(body["message"].as_str().unwrap().contains("conditions"));
+    }
+
+    #[tokio::test]
+    async fn audit_extra_threshold_queries_validate_limits_before_database_access() {
+        let service = Service::new(routes());
+        let cases = [
+            (
+                "http://127.0.0.1/api/v1/queries/v2/audit-extra/live-pv/weighted-acu-below",
+                json!({
+                    "project_id": 1,
+                    "activity_period_id": 2,
+                    "weighted_average_acu_lt": -1
+                }),
+                "weighted_average_acu_lt",
+            ),
+            (
+                "http://127.0.0.1/api/v1/queries/v2/audit-extra/video-play/author-total-below",
+                json!({
+                    "project_id": 1,
+                    "activity_period_id": 2,
+                    "author_total_play_count_lt": -1
+                }),
+                "author_total_play_count_lt",
+            ),
+        ];
+
+        for (url, payload, expected_field) in cases {
+            let mut response = TestClient::post(url).json(&payload).send(&service).await;
+            assert_eq!(response.status_code, Some(StatusCode::BAD_REQUEST));
+            let body = response.take_json::<Value>().await.unwrap();
+            assert_eq!(body["code"], "bad_request");
+            assert!(body["message"].as_str().unwrap().contains(expected_field));
+        }
     }
 
     #[tokio::test]
