@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "星图登录态同步助手",
+  "version": "0.3.0",
+  "description": "自动/手动采集 xingtu.cn 登录态并同步到星图工作流服务端。",
+  "permissions": ["cookies", "storage", "tabs", "alarms"],
+  "host_permissions": [
+    "https://www.xingtu.cn/*",
+    "https://*.xingtu.cn/*",
+    "https://api.example.com/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.xingtu.cn/*", "https://*.xingtu.cn/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "星图登录态同步",
+    "default_popup": "popup.html"
+  }
+}

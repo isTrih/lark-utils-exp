@@ -1,0 +1,16 @@
+{
+  "name": "lark-utils-data-sync-config",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@lark-base-open/connector-api": "0.1.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.20",
+    "typescript": "^5.9.3"
+  }
+}

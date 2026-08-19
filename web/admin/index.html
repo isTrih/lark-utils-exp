@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Lark Utils 内部控制台</title>
+    <link rel="stylesheet" href="/admin-console/styles.css" />
+  </head>
+  <body>
+    <header>
+      <div>
+        <p class="eyebrow">LARK UTILS EXP</p>
+        <h1>内部业务控制台</h1>
+        <p>项目健康、任务历史与失败补偿</p>
+      </div>
+      <label class="token">Bearer Token<input id="token" type="password" autocomplete="off" placeholder="MUTATION_API_TOKEN" /></label>
+    </header>
+    <main>
+      <section><div class="section-title"><h2>系统概览</h2><button data-action="refresh">刷新</button></div><div id="status" class="cards"></div></section>
+      <section><h2>项目健康与数据新鲜度</h2><div id="projects" class="table-wrap"></div></section>
+      <section><h2>最近任务</h2><div id="runs" class="table-wrap"></div></section>
+      <section><h2>失败来源</h2><div id="failures" class="table-wrap"></div></section>
+      <section><h2>异常隔离区</h2><div id="quarantine" class="table-wrap"></div></section>
+      <p id="message" role="status"></p>
+    </main>
+    <script src="/admin-console/app.js" defer></script>
+  </body>
+</html>

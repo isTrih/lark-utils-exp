@@ -1,0 +1,39 @@
+services:
+  lark-utils-exp:
+    image: trihlp/lark-utils-exp:latest
+    restart: unless-stopped
+    init: true
+    read_only: true
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file:
+      - .env
+    environment:
+      SERVER_BIND_ADDR: 0.0.0.0:8080
+      LOG_DIR: /app/logs
+      TZ: Asia/Shanghai
+    volumes:
+      - lark-utils-logs:/app/logs
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/live"]
+      interval: 30s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
+    cpus: 1.5
+    mem_limit: 1g
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+volumes:
+  lark-utils-logs:

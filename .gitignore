@@ -1,0 +1,44 @@
+# Rust / Bun build output
+/target/
+/dist/
+**/node_modules/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+/config/xingtu-extension-packages.json
+/configs/*.json
+/private-data/
+
+# Generated browser extension packages
+/browser-extensions/xingtu-session-uploader.zip
+/dist/xingtu-session-uploader/
+*.zip
+*.sha256
+
+# Local exports, backups and databases
+/sheet_data.csv
+/sheet_data.json
+*.dump
+*.backup
+*.sqlite
+*.sqlite3
+*.db
+
+# Keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+
+# Logs, coverage and editor files
+*.log
+/logs/
+/coverage/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>星图登录态同步</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="header">
+        <h1>星图登录态同步</h1>
+        <p id="statusText">正在读取状态</p>
+      </header>
+
+      <section class="section">
+        <label>
+          <span>分发对象</span>
+          <input id="recipientName" type="text" readonly />
+        </label>
+        <label>
+          <span>分发编号</span>
+          <input id="distributionId" type="text" readonly />
+        </label>
+        <label>
+          <span>服务端地址</span>
+          <input id="serverBaseUrl" type="url" readonly />
+        </label>
+        <label>
+          <span>星图账号 ID</span>
+          <input id="xingtuAccountId" type="text" readonly />
+        </label>
+        <label class="checkbox">
+          <input id="autoUploadEnabled" type="checkbox" />
+          <span>自动上传登录态</span>
+        </label>
+        <label>
+          <span>自动上传间隔（分钟）</span>
+          <input id="uploadIntervalMinutes" type="number" min="5" step="1" />
+        </label>
+      </section>
+
+      <section class="actions">
+        <button id="saveButton" type="button">保存上传设置</button>
+        <button id="uploadButton" type="button">采集并上传</button>
+      </section>
+
+      <section class="section status">
+        <div class="row">
+          <span>最近动作</span>
+          <strong id="lastAction">-</strong>
+        </div>
+        <div class="row">
+          <span>更新时间</span>
+          <strong id="lastUpdatedAt">-</strong>
+        </div>
+        <pre id="lastResponse">{}</pre>
+      </section>
+    </main>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

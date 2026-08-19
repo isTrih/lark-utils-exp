@@ -1,0 +1,71 @@
+[
+  {
+    "project_id": 1,
+    "period": "示例项目第一期",
+    "period_code": "demo-2026-01-p01",
+    "task_month": "2026-01-01",
+    "bitable_url": "https://example.feishu.cn/wiki/ExampleWikiToken",
+    "need_trace": true,
+    "tracking_start_date": "2026-01-01",
+    "tracking_end_date": "2026-02-15",
+    "workflows": {
+      "morning_workflow_enabled": true,
+      "periodic_sync_enabled": true,
+      "periodic_sync_interval_hours": 2
+    },
+    "contents": [
+      {
+        "content_type": "live",
+        "sync_enabled": true,
+        "trace_enabled": true,
+        "xingtu_task": {
+          "task_id": "demo-live-task-id",
+          "task_name": "示例直播任务"
+        },
+        "source": {
+          "spreadsheet_url": "",
+          "spreadsheet_url_update_mode": "xingtu_export"
+        },
+        "tables": {
+          "main_table_id": "tblDemoLiveMain",
+          "manual_table_id": "tblDemoLiveManual",
+          "audit_table_id": "tblDemoLiveAudit"
+        },
+        "sync_rule": {
+          "data_source_field": "数据来源",
+          "spreadsheet_source_value": "星图数据",
+          "manual_source_value": "手动登记",
+          "manual_overrides_spreadsheet": false,
+          "manual_auto_approve": true,
+          "manual_auto_approve_result": "审核通过"
+        }
+      },
+      {
+        "content_type": "video",
+        "sync_enabled": true,
+        "trace_enabled": true,
+        "xingtu_task": {
+          "task_id": "demo-video-task-id",
+          "task_name": "示例短视频任务"
+        },
+        "source": {
+          "spreadsheet_url": "",
+          "spreadsheet_url_update_mode": "xingtu_export"
+        },
+        "tables": {
+          "main_table_id": "tblDemoVideoMain",
+          "manual_table_id": "tblDemoVideoManual",
+          "audit_table_id": "tblDemoVideoAudit"
+        },
+        "sync_rule": {
+          "data_source_field": "数据来源",
+          "spreadsheet_source_value": "星图数据",
+          "manual_source_value": "手动登记",
+          "manual_overrides_spreadsheet": false,
+          "manual_auto_approve": true,
+          "manual_auto_approve_result": "审核通过"
+        }
+      }
+    ]
+  }
+]

@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_USER: lark_test
+          POSTGRES_PASSWORD: lark_test
+          POSTGRES_DB: lark_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lark_test -d lark_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://lark_test:lark_test@127.0.0.1:5432/lark_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: cargo fmt --all -- --check
+      - run: cargo check --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - run: git diff --check
+      - run: bun install --frozen-lockfile
+        working-directory: web/data-sync-config
+      - run: bun test
+        working-directory: web/data-sync-config
+      - run: bun run typecheck
+        working-directory: web/data-sync-config
+      - run: bun run build
+        working-directory: web/data-sync-config
+      - run: bun build web/admin/app.js --target=browser --outfile=/tmp/admin-console.js
+      - run: bun build browser-extensions/xingtu-session-uploader/popup.js --target=browser --outfile=/tmp/xingtu-popup.js
+      - run: bun build browser-extensions/xingtu-session-uploader/service-worker.js --target=browser --outfile=/tmp/xingtu-worker.js
+      - run: bun build browser-extensions/xingtu-session-uploader/content-script.js --target=browser --outfile=/tmp/xingtu-content.js
+      - run: bun test scripts/package-xingtu-extension.test.ts
+      - run: bun build scripts/package-xingtu-extension.ts --target=bun --outfile=/tmp/package-xingtu-extension
+      - run: bun build scripts/decrypt-data.ts --target=bun --outfile=/tmp/decrypt-data
+      - run: bun build scripts/postgres-backup.ts --target=bun --outfile=/tmp/postgres-backup
+      - run: bun build scripts/prune-logs.ts --target=bun --outfile=/tmp/prune-logs
+      - run: git diff --exit-code -- web/data-sync-config/dist
+      - run: git diff --check

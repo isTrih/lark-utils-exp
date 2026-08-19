@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>项目日报同步</title>
+    <link rel="stylesheet" href="/data-sync/config/styles.css" />
+  </head>
+  <body>
+    <main>
+      <form id="config-form">
+        <label for="project-select">同步项目</label>
+        <select id="project-select" name="activity_period_id" disabled>
+          <option value="">正在读取项目...</option>
+        </select>
+        <p id="status" role="status" aria-live="polite"></p>
+        <button id="save-button" type="submit" disabled>保存并继续</button>
+      </form>
+    </main>
+    <script type="module" src="/data-sync/config/app.js"></script>
+  </body>
+</html>

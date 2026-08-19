@@ -1,0 +1,53 @@
+[package]
+name = "lark-exp"
+version = "2.0.0"
+edition = "2024"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+# 错误处理
+anyhow = "1.0.103"
+aes-gcm = "0.10.3"
+base64 = "0.22.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10.4"
+getrandom = "0.3.4"
+
+# 处理csv
+csv = "1.4.0"
+
+# 环境变量
+dotenvy = "0.15.7"
+
+# Moka 异步缓存，需要开启 future feature
+moka = {version= "0.12.15", features = ["future"]}
+openlark = { git = "https://github.com/foxzool/openlark.git", branch = "main", default-features = false, features = ["auth", "communication", "docs-full"]}
+
+# HTTP 请求
+reqwest = { version = "0.13.4", features = ["json"] }
+regex = "1.12.2"
+
+# Salvo 服务端；oapi 用于生成 Swagger/OpenAPI 文档。
+salvo = { version = "0.89.0", features = ["logging", "affix-state", "oapi", "cors", "compression", "timeout"] }
+
+# 序列化
+serde =  { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha1 = "0.10.6"
+zstd = "0.13.3"
+
+# PostgreSQL 数据库访问
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "migrate"] }
+
+# 异步运行时
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "fs", "net", "io-util"] }
+
+# 日志
+tracing = "0.1.44"
+tracing-appender = "0.2.4"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+
+# url 切分
+url = "2.5.8"
+urlencoding = "2.1.3"

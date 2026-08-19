@@ -1,0 +1,151 @@
+:root {
+  color-scheme: light;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 360px;
+  margin: 0;
+  color: #16202a;
+  background: #f5f7fa;
+}
+
+.app {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.header {
+  display: grid;
+  gap: 4px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+p {
+  margin: 0;
+  color: #5a6675;
+}
+
+.section {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  background: #ffffff;
+  border: 1px solid #dbe2ea;
+  border-radius: 8px;
+}
+
+label {
+  display: grid;
+  gap: 5px;
+  color: #3d4a5c;
+  font-weight: 600;
+}
+
+input {
+  width: 100%;
+  height: 34px;
+  padding: 0 9px;
+  color: #16202a;
+  background: #ffffff;
+  border: 1px solid #c9d3df;
+  border-radius: 6px;
+  outline: none;
+}
+
+input:focus {
+  border-color: #246bfe;
+  box-shadow: 0 0 0 2px rgba(36, 107, 254, 0.14);
+}
+
+input[readonly] {
+  color: #526173;
+  background: #f2f5f8;
+  cursor: default;
+}
+
+.checkbox {
+  grid-template-columns: 18px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.checkbox input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+button {
+  min-height: 34px;
+  padding: 0 10px;
+  color: #ffffff;
+  font-weight: 700;
+  background: #246bfe;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+button:first-child {
+  color: #1f3146;
+  background: #e5ebf3;
+}
+
+button:last-child {
+  background: #167c5a;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.status {
+  gap: 8px;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 86px 1fr;
+  gap: 8px;
+  color: #5a6675;
+}
+
+.row strong {
+  min-width: 0;
+  color: #16202a;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+pre {
+  max-height: 180px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  color: #203040;
+  background: #f2f5f8;
+  border-radius: 6px;
+  white-space: pre-wrap;
+}

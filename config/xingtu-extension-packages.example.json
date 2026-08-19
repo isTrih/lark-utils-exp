@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "serverBaseUrl": "https://api.example.com",
+  "sessionUploadToken": "replace-with-a-shared-random-token-at-least-32-characters",
+  "defaults": {
+    "autoUploadEnabled": true,
+    "uploadIntervalMinutes": 30
+  },
+  "packages": [
+    {
+      "distributionId": "operator-a-main",
+      "recipientName": "运营同事 A",
+      "xingtuAccountId": "replace-with-xingtu-account-id",
+      "enabled": true
+    },
+    {
+      "distributionId": "operator-b-main",
+      "recipientName": "运营同事 B",
+      "xingtuAccountId": "replace-with-another-xingtu-account-id",
+      "enabled": false,
+      "uploadIntervalMinutes": 15
+    }
+  ]
+}
