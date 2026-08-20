@@ -243,6 +243,7 @@ pub struct AuditExtraLiveSessionDto {
     pub live_game_name: Option<String>,
     pub pulled_at: Option<DateTime<Utc>>,
     pub audit_result: Option<String>,
+    pub label: Option<String>,
     /// 审核扩展字段；顶层机密字段 `key` 永不返回。
     pub audit_extra: Value,
     pub last_seen_at: DateTime<Utc>,
@@ -633,6 +634,7 @@ pub async fn search(
             live.live_game_name,
             live.pulled_at,
             live.audit_result,
+            live.label,
             live.audit_extra,
             live.last_seen_at
         FROM live_session live
@@ -1042,6 +1044,7 @@ fn live_from_row(row: sqlx::postgres::PgRow) -> Result<AuditExtraLiveSessionDto,
         live_game_name: row.try_get("live_game_name")?,
         pulled_at: row.try_get("pulled_at")?,
         audit_result: row.try_get("audit_result")?,
+        label: row.try_get("label")?,
         audit_extra: redact_audit_extra(row.try_get("audit_extra")?),
         last_seen_at: row.try_get("last_seen_at")?,
     })

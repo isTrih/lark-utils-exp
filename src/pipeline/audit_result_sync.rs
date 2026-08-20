@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-const VIDEO_AUDIT_LABEL_FIELD: &str = "审核标签";
+const AUDIT_LABEL_FIELD: &str = "审核标签";
 const AUDIT_EXTRA_FIELD_PREFIX: &str = "【额外】";
 
 /// 一次审核结果回写的汇总。
@@ -41,7 +41,6 @@ pub async fn sync_audit_results_to_database(
             .with_context(|| format!("读取活动 `{display_name}` 审核表失败"))?;
         let updates = collect_reviewed_audit_results(
             &records,
-            config.content_type,
             unique_key_field(config.content_type),
             &config.audit_result_field,
         )
@@ -84,7 +83,6 @@ fn unique_key_field(
 
 fn collect_reviewed_audit_results(
     records: &[BitableRecord],
-    content_type: crate::xingtu::activity_config::XingtuContentType,
     unique_key_field: &str,
     audit_result_field: &str,
 ) -> anyhow::Result<Vec<AuditResultUpdate>> {
@@ -108,17 +106,10 @@ fn collect_reviewed_audit_results(
         else {
             continue;
         };
-        let label = if matches!(
-            content_type,
-            crate::xingtu::activity_config::XingtuContentType::Video
-        ) {
-            find_field_value_by_name(fields, VIDEO_AUDIT_LABEL_FIELD)
-                .and_then(value_to_plain_string)
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        } else {
-            None
-        };
+        let label = find_field_value_by_name(fields, AUDIT_LABEL_FIELD)
+            .and_then(value_to_plain_string)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
 
         let update = AuditResultUpdate {
             unique_key: unique_key.clone(),
@@ -215,8 +206,6 @@ mod tests {
 
     #[test]
     fn collects_only_non_empty_review_results() {
-        use crate::xingtu::activity_config::XingtuContentType;
-
         let records = vec![
             new_record(json!({
                 "视频/图文 ID": "video-1",
@@ -235,13 +224,8 @@ mod tests {
             })),
         ];
 
-        let updates = collect_reviewed_audit_results(
-            &records,
-            XingtuContentType::Video,
-            "视频/图文ID",
-            "审核结果",
-        )
-        .expect("audit results should parse");
+        let updates = collect_reviewed_audit_results(&records, "视频/图文ID", "审核结果")
+            .expect("audit results should parse");
 
         assert_eq!(
             updates,
@@ -264,8 +248,6 @@ mod tests {
 
     #[test]
     fn collects_empty_or_missing_video_label_as_none() {
-        use crate::xingtu::activity_config::XingtuContentType;
-
         let records = vec![
             new_record(json!({
                 "视频/图文ID": "video-1",
@@ -278,13 +260,8 @@ mod tests {
             })),
         ];
 
-        let updates = collect_reviewed_audit_results(
-            &records,
-            XingtuContentType::Video,
-            "视频/图文ID",
-            "审核结果",
-        )
-        .expect("empty labels should clear the database label");
+        let updates = collect_reviewed_audit_results(&records, "视频/图文ID", "审核结果")
+            .expect("empty labels should clear the database label");
 
         assert_eq!(updates.len(), 2);
         assert!(updates.iter().all(|update| update.label.is_none()));
@@ -292,28 +269,16 @@ mod tests {
 
     #[test]
     fn rejects_conflicting_results_for_same_unique_key() {
-        use crate::xingtu::activity_config::XingtuContentType;
-
         let records = vec![
             new_record(json!({ "直播间ID": "live-1", "审核结果": "通过" })),
             new_record(json!({ "直播间ID": "live-1", "审核结果": "不通过" })),
         ];
 
-        assert!(
-            collect_reviewed_audit_results(
-                &records,
-                XingtuContentType::Live,
-                "直播间ID",
-                "审核结果"
-            )
-            .is_err()
-        );
+        assert!(collect_reviewed_audit_results(&records, "直播间ID", "审核结果").is_err());
     }
 
     #[test]
     fn rejects_conflicting_video_labels_for_same_unique_key() {
-        use crate::xingtu::activity_config::XingtuContentType;
-
         let records = vec![
             new_record(json!({
                 "视频/图文ID": "video-1",
@@ -327,44 +292,27 @@ mod tests {
             })),
         ];
 
-        assert!(
-            collect_reviewed_audit_results(
-                &records,
-                XingtuContentType::Video,
-                "视频/图文ID",
-                "审核结果"
-            )
-            .is_err()
-        );
+        assert!(collect_reviewed_audit_results(&records, "视频/图文ID", "审核结果").is_err());
     }
 
     #[test]
-    fn live_audit_results_ignore_video_label_field() {
-        use crate::xingtu::activity_config::XingtuContentType;
-
+    fn live_audit_results_sync_label_field() {
         let records = vec![new_record(json!({
             "直播间ID": "live-1",
             "审核结果": "通过",
-            "审核标签": "不应同步",
+            "审核标签": "直播优质内容",
             "【额外】直播推荐": true
         }))];
 
-        let updates = collect_reviewed_audit_results(
-            &records,
-            XingtuContentType::Live,
-            "直播间ID",
-            "审核结果",
-        )
-        .expect("live audit results should parse");
+        let updates = collect_reviewed_audit_results(&records, "直播间ID", "审核结果")
+            .expect("live audit results should parse");
 
-        assert_eq!(updates[0].label, None);
+        assert_eq!(updates[0].label, Some("直播优质内容".to_owned()));
         assert_eq!(updates[0].audit_extra, json!({ "直播推荐": true }));
     }
 
     #[test]
     fn collects_audit_extra_fields_and_preserves_json_types() {
-        use crate::xingtu::activity_config::XingtuContentType;
-
         let records = vec![new_record(json!({
             "视频/图文ID": "video-extra",
             "审核结果": "审核通过",
@@ -385,13 +333,7 @@ mod tests {
             "普通字段": "不会进入"
         }))];
 
-        let updates = collect_reviewed_audit_results(
-            &records,
-            XingtuContentType::Video,
-            "视频/图文ID",
-            "审核结果",
-        )
-        .unwrap();
+        let updates = collect_reviewed_audit_results(&records, "视频/图文ID", "审核结果").unwrap();
 
         assert_eq!(
             updates[0].audit_extra,
@@ -446,8 +388,6 @@ mod tests {
 
     #[test]
     fn rejects_conflicting_extra_fields_for_same_unique_key() {
-        use crate::xingtu::activity_config::XingtuContentType;
-
         let records = vec![
             new_record(json!({
                 "视频/图文ID": "video-1",
@@ -461,15 +401,7 @@ mod tests {
             })),
         ];
 
-        assert!(
-            collect_reviewed_audit_results(
-                &records,
-                XingtuContentType::Video,
-                "视频/图文ID",
-                "审核结果"
-            )
-            .is_err()
-        );
+        assert!(collect_reviewed_audit_results(&records, "视频/图文ID", "审核结果").is_err());
     }
 
     fn new_record(fields: Value) -> BitableRecord {

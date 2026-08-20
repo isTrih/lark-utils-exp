@@ -373,15 +373,17 @@ impl XingtuDataImportRepository {
                 UPDATE live_session AS target
                 SET
                     audit_result = source.audit_result,
+                    label = source.label,
                     audit_extra = source.audit_extra,
                     updated_at = now()
-                FROM unnest($2::text[], $3::text[], $4::jsonb[])
-                    AS source(unique_key, audit_result, audit_extra)
+                FROM unnest($2::text[], $3::text[], $4::text[], $5::jsonb[])
+                    AS source(unique_key, audit_result, label, audit_extra)
                 WHERE
                     target.content_config_id = $1
                     AND target.live_room_id = source.unique_key
                     AND (
                         target.audit_result IS DISTINCT FROM source.audit_result
+                        OR target.label IS DISTINCT FROM source.label
                         OR target.audit_extra IS DISTINCT FROM source.audit_extra
                     )
                 "#
@@ -424,10 +426,15 @@ impl XingtuDataImportRepository {
                         .await
                 }
                 "live" => {
+                    let labels = chunk
+                        .iter()
+                        .map(|update| update.label.clone())
+                        .collect::<Vec<_>>();
                     sqlx::query(statement)
                         .bind(content_config_id)
                         .bind(unique_keys)
                         .bind(audit_results)
+                        .bind(labels)
                         .bind(audit_extras)
                         .execute(&mut *tx)
                         .await

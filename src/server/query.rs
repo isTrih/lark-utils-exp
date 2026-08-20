@@ -221,6 +221,7 @@ pub struct LiveSessionDto {
     pub live_exposure_pv: Option<i64>,
     pub acu: Option<f64>,
     pub audit_result: Option<String>,
+    pub label: Option<String>,
     /// 审核扩展字段；顶层机密字段 `key` 永不返回。
     pub audit_extra: Value,
     pub last_seen_at: DateTime<Utc>,
@@ -899,6 +900,7 @@ pub async fn list_live_sessions(
             live_exposure_pv,
             acu::float8 AS acu,
             audit_result,
+            label,
             audit_extra,
             last_seen_at
         FROM live_session
@@ -924,6 +926,7 @@ pub async fn list_live_sessions(
                 live_exposure_pv: row.try_get("live_exposure_pv")?,
                 acu: row.try_get("acu")?,
                 audit_result: row.try_get("audit_result")?,
+                label: row.try_get("label")?,
                 audit_extra: crate::server::audit_extra_query::redact_audit_extra(
                     row.try_get("audit_extra")?,
                 ),
@@ -1681,7 +1684,7 @@ pub async fn list_live_sessions_v2(
         r#"
         SELECT l.content_config_id, l.live_room_id, l.start_time, l.anchor_name, l.anchor_uid,
             l.title, l.cumulative_viewer_count, l.live_exposure_pv,
-            l.acu::float8 AS acu, l.audit_result, l.audit_extra, l.last_seen_at
+            l.acu::float8 AS acu, l.audit_result, l.label, l.audit_extra, l.last_seen_at
         FROM live_session l
         JOIN xingtu_activity_content_config c ON c.content_config_id = l.content_config_id
         WHERE ($1::bigint IS NULL OR c.activity_period_id = $1)
@@ -1719,6 +1722,7 @@ pub async fn list_live_sessions_v2(
                 live_exposure_pv: row.try_get("live_exposure_pv")?,
                 acu: row.try_get("acu")?,
                 audit_result: row.try_get("audit_result")?,
+                label: row.try_get("label")?,
                 audit_extra: crate::server::audit_extra_query::redact_audit_extra(
                     row.try_get("audit_extra")?,
                 ),
