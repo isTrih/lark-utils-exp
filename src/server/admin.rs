@@ -10,7 +10,7 @@ use crate::workflow_run::{WorkflowRunRecord, WorkflowStepRecord};
 use crate::xingtu::activity_config::{
     ActivityContentConfig, WorkflowConfig, validate_activity_contents,
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use salvo::http::header::{CACHE_CONTROL, HeaderValue, PRAGMA};
 use salvo::oapi::{ToParameters, ToSchema};
 use salvo::prelude::*;
@@ -2156,6 +2156,11 @@ fn validate_project_notification(body: &ProjectNotificationInput) -> Result<(), 
 
 fn validate_project_period_request(body: &UpsertProjectPeriodRequest) -> Result<(), ApiError> {
     required_text(&body.period, "period")?;
+    if Datelike::day(&body.task_month) != 1 {
+        return Err(ApiError::bad_request(
+            "task_month 必须是对应月份的第一天（YYYY-MM-01）",
+        ));
+    }
     let bitable_url = required_text(&body.bitable_url, "bitable_url")?;
     let url = url::Url::parse(&bitable_url)
         .map_err(|_| ApiError::bad_request("bitable_url 不是合法 URL"))?;
