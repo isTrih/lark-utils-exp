@@ -1674,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "lark-exp"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
