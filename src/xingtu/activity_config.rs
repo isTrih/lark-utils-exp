@@ -1123,7 +1123,26 @@ impl XingtuActivityConfigRepository {
             let manual_table_id = trim_optional(content.tables.manual_table_id.as_deref());
             let task_name = trim_optional(content.xingtu_task.task_name.as_deref());
 
-            let saved = sqlx::query(
+            let task_id = content.xingtu_task.task_id.trim();
+            let existing_task = sqlx::query(
+                "SELECT activity_period_id, content_type::text AS content_type FROM xingtu_activity_content_config WHERE xingtu_task_id = $1",
+            )
+            .bind(task_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            if let Some(existing_task) = existing_task {
+                let existing_period_id: i64 = existing_task.try_get("activity_period_id")?;
+                let existing_content_type: String = existing_task.try_get("content_type")?;
+                if existing_period_id != activity_period_id
+                    || existing_content_type != content.content_type.as_db_value()
+                {
+                    return Err(anyhow!(
+                        "星图任务 `{task_id}` 已属于期次 {existing_period_id} 的 {existing_content_type} 内容，不能重复使用"
+                    ));
+                }
+            }
+
+            sqlx::query(
                 r#"
                 INSERT INTO xingtu_activity_content_config (
                     activity_period_id,
@@ -1165,8 +1184,9 @@ impl XingtuActivityConfigRepository {
                     $16,
                     $17
                 )
-                ON CONFLICT (xingtu_task_id)
+                ON CONFLICT (activity_period_id, content_type)
                 DO UPDATE SET
+                    xingtu_task_id = EXCLUDED.xingtu_task_id,
                     activity_period_id = EXCLUDED.activity_period_id,
                     content_type = EXCLUDED.content_type,
                     xingtu_task_name = EXCLUDED.xingtu_task_name,
@@ -1193,7 +1213,7 @@ impl XingtuActivityConfigRepository {
             )
             .bind(activity_period_id)
             .bind(content.content_type.as_db_value())
-            .bind(content.xingtu_task.task_id.trim())
+            .bind(task_id)
             .bind(task_name)
             .bind(spreadsheet_url)
             .bind(content.source.spreadsheet_url_update_mode.trim())
@@ -1217,12 +1237,6 @@ impl XingtuActivityConfigRepository {
                     content.xingtu_task.task_id
                 )
             })?;
-            if saved.rows_affected() != 1 {
-                return Err(anyhow!(
-                    "星图任务 `{}` 已属于其他期次，不能移动",
-                    content.xingtu_task.task_id.trim()
-                ));
-            }
         }
 
         let submitted_task_ids = contents
