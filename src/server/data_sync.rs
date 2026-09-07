@@ -895,6 +895,8 @@ async fn load_video_days(
             FROM video_content vc
             JOIN video_configs cfg
               ON cfg.content_config_id = vc.content_config_id
+            WHERE vc.publish_time >= $2::date
+              AND vc.publish_time < ($3::date + 1)
         ),
         author_first_date AS (
             SELECT author_key, MIN(publish_date) AS first_date
@@ -1008,6 +1010,8 @@ async fn load_live_days(
             FROM live_session ls
             JOIN live_configs cfg
               ON cfg.content_config_id = ls.content_config_id
+            WHERE ls.start_time >= $2::date
+              AND ls.start_time < ($3::date + 1)
         ),
         anchor_first_date AS (
             SELECT anchor_key, MIN(start_date) AS first_date

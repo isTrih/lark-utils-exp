@@ -108,6 +108,7 @@ pub fn routes() -> Router {
                 .post(ignore_failed_source),
         )
         .push(Router::with_path("quarantine").get(list_quarantine))
+        .push(Router::with_path("live-sessions/normalize").post(normalize_live_sessions))
         .push(Router::with_path("status").get(system_status))
         .push(Router::with_path("xingtu/session-upload-token").get(get_xingtu_session_upload_token))
         .push(crate::server::admin_sheet::routes())
@@ -569,6 +570,18 @@ struct UpdateActivityStatusRequest {
     need_trace: Option<bool>,
     morning_review_enabled: Option<bool>,
     periodic_sync_enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct NormalizeLiveSessionsRequest {
+    /// 默认只预览；明确传 false 才会移动或删除错期数据。
+    #[serde(default = "default_true")]
+    dry_run: bool,
+    /// 可选，仅规整指定主项目。
+    project_id: Option<i64>,
+    /// 可选，仅规整从指定期次落入的错期数据。
+    activity_period_id: Option<i64>,
 }
 
 #[endpoint(tags("admin"), summary = "查询主项目配置")]
@@ -1422,6 +1435,34 @@ async fn list_quarantine(
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()?,
     ))
+}
+
+#[endpoint(
+    tags("admin"),
+    summary = "按开播月份规整直播数据",
+    description = "将直播记录归入同一主项目下 task_month 与开播月份一致的活动期次。同一目标期次已有相同直播间 ID 时删除错期副本，否则移动记录并关联目标期次来源。直播间 ID 的唯一范围是同一主项目、同一活动月份；生产源中的 SDxxx 并非平台全局唯一 ID。dry_run 默认为 true，仅返回预计结果；明确传 false 才实际执行。找不到目标期次或目标飞书来源的记录不会删除，计入 unresolved_rows。"
+)]
+async fn normalize_live_sessions(
+    body: RequiredJsonBody<NormalizeLiveSessionsRequest>,
+    depot: &mut Depot,
+) -> ApiResult<crate::xingtu::data_import::LiveSessionNormalizationResult> {
+    let body = body.into_inner();
+    if body.project_id.is_some_and(|value| value <= 0) {
+        return Err(ApiError::bad_request("project_id 必须大于 0"));
+    }
+    if body.activity_period_id.is_some_and(|value| value <= 0) {
+        return Err(ApiError::bad_request("activity_period_id 必须大于 0"));
+    }
+    let state = state_from_depot(depot)?;
+    let result = state
+        .workflow
+        .data_import_repo
+        .normalize_live_sessions(body.project_id, body.activity_period_id, body.dry_run)
+        .await?;
+    if !body.dry_run {
+        state.query_cache.invalidate_all_shared().await?;
+    }
+    Ok(Json(result))
 }
 
 #[endpoint(
@@ -2365,6 +2406,7 @@ mod tests {
             "/api/v1/admin/workflow-runs",
             "/api/v1/admin/failed-sources",
             "/api/v1/admin/quarantine",
+            "/api/v1/admin/live-sessions/normalize",
             "/api/v1/admin/xingtu/session-upload-token",
             "/api/v1/admin/feishu/spreadsheets/format-analysis",
             "/api/v1/admin/feishu/chats",

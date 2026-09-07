@@ -58,7 +58,21 @@ pub async fn load_project_report_context(
 ) -> anyhow::Result<Option<ProjectReportContext>> {
     let row = sqlx::query(
         r#"
-        WITH latest_video_metric AS (
+        WITH period_context AS (
+            SELECT
+                p.activity_period_id,
+                project.display_name AS project,
+                p.period,
+                p.task_month,
+                p.bitable_url,
+                p.cpm_table_id
+            FROM xingtu_activity_period p
+            JOIN xingtu_project project ON project.project_id = p.project_id
+            WHERE
+                p.activity_period_id = $1
+                AND p.is_active = true
+        ),
+        latest_video_metric AS (
             SELECT DISTINCT ON (m.content_config_id, m.video_id)
                 m.content_config_id,
                 m.video_id,
@@ -66,9 +80,15 @@ pub async fn load_project_report_context(
             FROM video_daily_metric m
             JOIN xingtu_activity_content_config c
                 ON c.content_config_id = m.content_config_id
+            JOIN video_content vc
+                ON vc.content_config_id = m.content_config_id
+                AND vc.video_id = m.video_id
+            CROSS JOIN period_context p
             WHERE
-                c.activity_period_id = $1
+                c.activity_period_id = p.activity_period_id
                 AND c.content_type = 'video'
+                AND vc.publish_time >= p.task_month::timestamp
+                AND vc.publish_time < (p.task_month + INTERVAL '1 month')::timestamp
             ORDER BY
                 m.content_config_id,
                 m.video_id,
@@ -85,25 +105,24 @@ pub async fn load_project_report_context(
             FROM live_session ls
             JOIN xingtu_activity_content_config c
                 ON c.content_config_id = ls.content_config_id
+            CROSS JOIN period_context p
             WHERE
-                c.activity_period_id = $1
+                c.activity_period_id = p.activity_period_id
                 AND c.content_type = 'live'
+                AND ls.start_time >= p.task_month::timestamp
+                AND ls.start_time < (p.task_month + INTERVAL '1 month')::timestamp
         )
         SELECT
             p.activity_period_id,
-            project.display_name AS project,
+            p.project,
             p.period,
             p.bitable_url,
             p.cpm_table_id,
             video_total.video_play,
             live_total.live_pv
-        FROM xingtu_activity_period p
-        JOIN xingtu_project project ON project.project_id = p.project_id
+        FROM period_context p
         CROSS JOIN video_total
         CROSS JOIN live_total
-        WHERE
-            p.activity_period_id = $1
-            AND p.is_active = true
         "#,
     )
     .bind(activity_period_id)

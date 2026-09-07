@@ -4,7 +4,7 @@ use crate::pipeline::sync::{FieldValueRules, SourceRow, parse_sheet_rows, value_
 use crate::pipeline::video::VIDEO_UNIQUE_KEY_FIELD;
 use crate::{client::LarkClient, pipeline::live::LIVE_UNIQUE_KEY_FIELD};
 use anyhow::{Context, anyhow};
-use chrono::{NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, TimeZone};
 use chrono_tz::Asia::Shanghai;
 use salvo::oapi::ToSchema;
 use serde::Serialize;
@@ -121,6 +121,15 @@ pub struct PendingFeishuSource {
 pub struct PersistMergedRecordsResult {
     pub persisted_rows: usize,
     pub quarantined_rows: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+pub struct LiveSessionNormalizationResult {
+    pub dry_run: bool,
+    pub misplaced_rows: usize,
+    pub duplicate_rows_removed: usize,
+    pub rows_moved: usize,
+    pub unresolved_rows: usize,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -263,6 +272,21 @@ impl XingtuDataImportRepository {
 
         let mut tx = self.pool.begin().await.context("开启数据入库事务失败")?;
         let mut result = PersistMergedRecordsResult::default();
+        let expected_live_month = if options.content_type == "live" {
+            sqlx::query_scalar::<_, NaiveDate>(
+                r#"
+                SELECT p.task_month
+                FROM xingtu_activity_content_config c
+                JOIN xingtu_activity_period p ON p.activity_period_id = c.activity_period_id
+                WHERE c.content_config_id = $1
+                "#,
+            )
+            .bind(options.content_config_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
 
         for row in &rows {
             let required_time_field = match options.content_type.as_str() {
@@ -270,29 +294,34 @@ impl XingtuDataImportRepository {
                 "live" => "开播时间",
                 other => return Err(anyhow!("未知 content_type：{other}")),
             };
-            if field_timestamp(&row.fields, required_time_field).is_none() {
-                sqlx::query(
-                    r#"
-                    INSERT INTO xingtu_data_quarantine (
-                        feishu_source_id, content_config_id, content_type, unique_key,
-                        reason_code, reason_message, raw_fields
-                    )
-                    VALUES ($1, $2, $3::xingtu_content_type, $4, 'missing_business_time', $5, $6)
-                    ON CONFLICT DO NOTHING
-                    "#,
+            let Some(business_time) = field_timestamp(&row.fields, required_time_field) else {
+                quarantine_row(
+                    &mut tx,
+                    &options,
+                    row,
+                    "missing_business_time",
+                    &format!("缺少或无法解析必填业务时间字段 `{required_time_field}`"),
                 )
-                .bind(options.feishu_source_id)
-                .bind(options.content_config_id)
-                .bind(&options.content_type)
-                .bind(&row.unique_key)
-                .bind(format!(
-                    "缺少或无法解析必填业务时间字段 `{required_time_field}`"
-                ))
-                .bind(Value::Object(row.fields.clone()))
-                .execute(&mut *tx)
-                .await
-                .with_context(|| format!("隔离异常数据失败：{}", row.unique_key))?;
+                .await?;
                 // 即使该异常行已在隔离区中存在，本轮仍然遇到了一条无效业务数据。
+                result.quarantined_rows += 1;
+                continue;
+            };
+            if let Some(expected_month) = expected_live_month
+                && !belongs_to_month(business_time, expected_month)
+            {
+                quarantine_row(
+                    &mut tx,
+                    &options,
+                    row,
+                    "outside_activity_month",
+                    &format!(
+                        "开播时间 {} 不属于活动月份 {}",
+                        business_time.date(),
+                        expected_month.format("%Y-%m")
+                    ),
+                )
+                .await?;
                 result.quarantined_rows += 1;
                 continue;
             }
@@ -333,6 +362,122 @@ impl XingtuDataImportRepository {
         }
 
         tx.commit().await.context("提交数据入库事务失败")?;
+        Ok(result)
+    }
+
+    /// 按主项目和开播月份把直播记录归入正确期次，并消除跨期副本。
+    pub async fn normalize_live_sessions(
+        &self,
+        project_id: Option<i64>,
+        activity_period_id: Option<i64>,
+        dry_run: bool,
+    ) -> anyhow::Result<LiveSessionNormalizationResult> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("开启直播数据规整事务失败")?;
+        sqlx::query("LOCK TABLE live_session IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                ls.content_config_id AS source_config_id,
+                ls.live_room_id,
+                target.content_config_id AS target_config_id,
+                existing.live_room_id IS NOT NULL AS target_has_same_id,
+                target_source.feishu_source_id AS target_source_id
+            FROM live_session ls
+            JOIN xingtu_activity_content_config source
+                ON source.content_config_id = ls.content_config_id
+            JOIN xingtu_activity_period source_period
+                ON source_period.activity_period_id = source.activity_period_id
+            LEFT JOIN xingtu_activity_period target_period
+                ON target_period.project_id = source_period.project_id
+                AND target_period.task_month = date_trunc('month', ls.start_time)::date
+            LEFT JOIN xingtu_activity_content_config target
+                ON target.activity_period_id = target_period.activity_period_id
+                AND target.content_type = 'live'
+            LEFT JOIN live_session existing
+                ON existing.content_config_id = target.content_config_id
+                AND existing.live_room_id = ls.live_room_id
+            LEFT JOIN LATERAL (
+                SELECT s.feishu_source_id
+                FROM xingtu_feishu_source s
+                WHERE s.content_config_id = target.content_config_id
+                ORDER BY
+                    ABS(s.stat_date - ls.start_time::date),
+                    s.imported_at DESC NULLS LAST,
+                    s.feishu_source_id DESC
+                LIMIT 1
+            ) target_source ON true
+            WHERE source.content_type = 'live'
+                AND date_trunc('month', ls.start_time)::date <> source_period.task_month
+                AND ($1::bigint IS NULL OR source_period.project_id = $1)
+                AND ($2::bigint IS NULL OR source_period.activity_period_id = $2)
+            ORDER BY ls.content_config_id, ls.live_room_id
+            "#,
+        )
+        .bind(project_id)
+        .bind(activity_period_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut result = LiveSessionNormalizationResult {
+            dry_run,
+            misplaced_rows: rows.len(),
+            ..Default::default()
+        };
+        for row in rows {
+            let source_config_id: i64 = row.try_get("source_config_id")?;
+            let live_room_id: String = row.try_get("live_room_id")?;
+            let target_config_id: Option<i64> = row.try_get("target_config_id")?;
+            let target_has_same_id: bool = row.try_get("target_has_same_id")?;
+            let target_source_id: Option<i64> = row.try_get("target_source_id")?;
+
+            match (target_config_id, target_source_id, target_has_same_id) {
+                (Some(_), _, true) => {
+                    result.duplicate_rows_removed += 1;
+                    if !dry_run {
+                        sqlx::query(
+                            "DELETE FROM live_session WHERE content_config_id = $1 AND live_room_id = $2",
+                        )
+                        .bind(source_config_id)
+                        .bind(&live_room_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+                (Some(target_config_id), Some(target_source_id), false) => {
+                    result.rows_moved += 1;
+                    if !dry_run {
+                        sqlx::query(
+                            r#"
+                            UPDATE live_session
+                            SET content_config_id = $3,
+                                feishu_source_id = $4,
+                                updated_at = now()
+                            WHERE content_config_id = $1 AND live_room_id = $2
+                            "#,
+                        )
+                        .bind(source_config_id)
+                        .bind(&live_room_id)
+                        .bind(target_config_id)
+                        .bind(target_source_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+                _ => result.unresolved_rows += 1,
+            }
+        }
+
+        if dry_run {
+            tx.rollback().await?;
+        } else {
+            tx.commit().await.context("提交直播数据规整事务失败")?;
+        }
         Ok(result)
     }
 
@@ -990,6 +1135,36 @@ impl XingtuDataImportRepository {
     }
 }
 
+async fn quarantine_row(
+    tx: &mut Transaction<'_, Postgres>,
+    options: &PersistMergedRecordsOptions,
+    row: &MergedRecordForDb,
+    reason_code: &str,
+    reason_message: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO xingtu_data_quarantine (
+            feishu_source_id, content_config_id, content_type, unique_key,
+            reason_code, reason_message, raw_fields
+        )
+        VALUES ($1, $2, $3::xingtu_content_type, $4, $5, $6, $7)
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(options.feishu_source_id)
+    .bind(options.content_config_id)
+    .bind(&options.content_type)
+    .bind(&row.unique_key)
+    .bind(reason_code)
+    .bind(reason_message)
+    .bind(Value::Object(row.fields.clone()))
+    .execute(&mut **tx)
+    .await
+    .with_context(|| format!("隔离异常数据失败：{}", row.unique_key))?;
+    Ok(())
+}
+
 /// 扫描 pending 飞书来源，读取 Sheet 后写入数据库。
 pub async fn import_pending_feishu_sources(
     repo: &XingtuDataImportRepository,
@@ -1342,6 +1517,10 @@ fn parse_naive_datetime(value: &str) -> Option<NaiveDateTime> {
         })
 }
 
+fn belongs_to_month(value: NaiveDateTime, month: NaiveDate) -> bool {
+    (value.year(), value.month()) == (month.year(), month.month())
+}
+
 fn normalize_name(value: &str) -> String {
     value
         .trim()
@@ -1435,5 +1614,24 @@ mod tests {
             Value::String("invalid timestamp".to_owned()),
         )]);
         assert!(field_timestamp(&fields, "发布时间").is_none());
+    }
+
+    #[test]
+    fn live_business_time_must_belong_to_activity_month() {
+        let month = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        assert!(belongs_to_month(
+            NaiveDate::from_ymd_opt(2026, 9, 30)
+                .unwrap()
+                .and_hms_opt(23, 59, 59)
+                .unwrap(),
+            month
+        ));
+        assert!(!belongs_to_month(
+            NaiveDate::from_ymd_opt(2026, 8, 31)
+                .unwrap()
+                .and_hms_opt(23, 59, 59)
+                .unwrap(),
+            month
+        ));
     }
 }

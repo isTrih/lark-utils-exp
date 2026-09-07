@@ -111,16 +111,16 @@ Host，不会返回 HTTP 配置页地址。
 | 星期 | 日期对应的中文星期 |
 | 活动周期 | 从 `task_month` 起算的第 N 天 |
 | 每日新增活跃作者 | 首次发布稿件日期为当天的去重作者数；优先使用作者 UID，缺失时使用作者名 |
-| 累计活跃作者 | 截至当天发布过稿件的去重作者数，包含项目月份前已出现的作者 |
+| 累计活跃作者 | 从 `task_month` 月初截至当天发布过稿件的去重作者数 |
 | 每日新增视频 | 发布日期为当天的稿件数 |
 | 累计视频 | 截至当天已发布的稿件数 |
 | 每日视频最终播放 | 当天发布稿件的当前最新播放量总和；后续同步会随最新数据更新 |
 | 每日新增播放量 | 当天所有视频播放总量减去昨日所有视频播放总量 |
 | 累计播放量 | 截至当天，每个视频取不晚于当天的最新快照后求和 |
 | 每日新增主播 | 首次开播日期为当天的去重主播数；优先使用主播 UID，缺失时使用主播名 |
-| 累计主播数 | 截至当天已开播的去重主播数，包含项目月份前已出现的主播 |
+| 累计主播数 | 从 `task_month` 月初截至当天已开播的去重主播数 |
 | 每日新增观看人次 | 当天直播场次的 `live_exposure_pv` 总和 |
-| 累计观看人次 | 截至当天直播场次的 `live_exposure_pv` 总和 |
+| 累计观看人次 | 从 `task_month` 月初截至当天直播场次的 `live_exposure_pv` 总和 |
 | 平均ACU | 当天直播场次 ACU 的算术平均值，保留两位小数；当天没有直播场次时为空 |
 
 ### 请求签名
@@ -598,9 +598,9 @@ curl -X POST \
 
 | 变量 | 数据来源 |
 | --- | --- |
-| `video_play` | 该期每个视频最新 `play_count` 的总和除以 10000，单位为万，保留两位小数 |
+| `video_play` | 该期 `task_month` 自然月内发布的视频，各取最新 `play_count` 后求和并除以 10000，单位为万，保留两位小数 |
 | `video_cpm` | CPM 表字段 `视频CPM`，保留两位小数 |
-| `live_pv` | 该期全部直播 `live_exposure_pv` 总和除以 10000，单位为万，保留两位小数 |
+| `live_pv` | 该期 `task_month` 自然月内直播场次的 `live_exposure_pv` 总和除以 10000，单位为万，保留两位小数 |
 | `live_cpm` | CPM 表字段 `直播CPM`，保留两位小数 |
 | `date` | 接口触发时的北京时间日期，格式 `YYYY-MM-DD` |
 | `mission` | 请求中的今日事项 Markdown |
@@ -795,10 +795,24 @@ GET  /api/v1/admin/failed-sources
 POST /api/v1/admin/failed-sources/{feishu_source_id}/retry
 POST /api/v1/admin/failed-sources/{feishu_source_id}/ignore
 GET  /api/v1/admin/quarantine
+POST /api/v1/admin/live-sessions/normalize
 ```
 
 重试接口只处理指定来源并受 PostgreSQL 全局工作流锁保护；忽略后自动队列不再处理该来源。
 隔离行在同一业务键后续成功入库时自动标记 `resolved_at`。
+
+直播数据规整接口根据开播时间，将记录归入同一主项目下 `task_month` 对应的活动期次。同一目标期次已有相同 `直播间ID` 时删除错期副本，否则移动记录并关联目标期次的飞书来源。由于星图源中的 `SDxxx` 会跨项目、跨月份复用，唯一范围是“主项目 + 活动月份 + 直播间ID”，不是全平台 ID。
+
+默认仅预览：
+
+```bash
+curl -X POST "https://api.example.com/api/v1/admin/live-sessions/normalize" \
+  -H "Authorization: Bearer $MUTATION_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"dry_run":true,"project_id":1,"activity_period_id":10}'
+```
+
+确认返回的 `duplicate_rows_removed`、`rows_moved` 和 `unresolved_rows` 后，将 `dry_run` 改为 `false` 执行。找不到目标期次或目标飞书来源的记录不会被删除。
 
 活动状态更新示例：
 
