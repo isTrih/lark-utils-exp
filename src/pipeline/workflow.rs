@@ -68,6 +68,17 @@ pub async fn run_activity_sync_workflow(
     Ok(())
 }
 
+/// 使用调用方按项目解析出的飞书客户端执行同步。
+pub async fn run_activity_sync_workflow_with_client(
+    lark: LarkClient,
+    activity_configs: Vec<ActivitySyncConfig>,
+) -> anyhow::Result<()> {
+    tracing::info!("开始执行项目级飞书应用活动同步工作流");
+    run_sync_data_step(lark, activity_configs).await?;
+    tracing::info!("项目级飞书应用活动同步工作流完成");
+    Ok(())
+}
+
 /// 工作流中的“同步数据”步骤。
 ///
 /// 这里按业务 pipeline 顺序触发直播和视频同步。后续如果需要并发、重试或任务状态记录，

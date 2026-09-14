@@ -1,6 +1,6 @@
 use std::env;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub lark_app_id: String,
     pub lark_app_secret: String,

@@ -1,11 +1,14 @@
+use crate::client::LarkClient;
 use crate::lark::im::{FeishuImClient, parse_receive_id_type};
 use crate::lark::message_history::{
     CardMessageCategory, CardMessageHistory, CardMessageHistoryFilter, CardMessageHistoryRepository,
 };
+use crate::lark::project_app::{FeishuAppMetadata, ProjectFeishuAppBinding};
 use crate::server::api::RequiredJsonBody;
 use crate::server::auth::{configured_xingtu_session_upload_token, require_mutation_token};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::state_from_depot;
+use crate::workflow::XingtuWorkflowService;
 use crate::workflow_run::{WorkflowRunRecord, WorkflowStepRecord};
 use crate::xingtu::activity_config::{
     ActivityContentConfig, WorkflowConfig, validate_activity_contents,
@@ -78,6 +81,22 @@ pub fn routes() -> Router {
                 .patch(update_project_notification),
         )
         .push(
+            Router::with_path("projects/{project_id}/feishu-app")
+                .get(get_project_feishu_app)
+                .put(bind_project_feishu_app)
+                .delete(unbind_project_feishu_app),
+        )
+        .push(
+            Router::with_path("feishu/apps")
+                .get(list_feishu_apps)
+                .post(create_feishu_app),
+        )
+        .push(
+            Router::with_path("feishu/apps/{feishu_app_id}")
+                .get(get_feishu_app)
+                .put(replace_feishu_app),
+        )
+        .push(
             Router::with_path("projects/{project_id}/accounts")
                 .get(list_project_accounts)
                 .post(create_project_account),
@@ -132,6 +151,19 @@ struct AdminListQuery {
 #[salvo(parameters(default_parameter_in = Path))]
 struct ProjectPath {
     project_id: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize, ToParameters, ToSchema)]
+#[salvo(parameters(default_parameter_in = Path))]
+struct FeishuAppPath {
+    feishu_app_id: i64,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, ToParameters, ToSchema)]
+#[salvo(parameters(default_parameter_in = Query))]
+struct FeishuAppListQuery {
+    /// 是否包含停用应用，默认 true。
+    include_inactive: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, ToParameters, ToSchema)]
@@ -191,6 +223,8 @@ struct OperationalListQuery {
 #[derive(Debug, Default, Deserialize, Serialize, ToParameters, ToSchema)]
 #[salvo(parameters(default_parameter_in = Query))]
 struct FeishuChatListQuery {
+    /// 使用指定项目绑定的飞书应用；不传时使用全局应用。
+    project_id: Option<i64>,
     /// 群主用户 ID 类型：open_id、union_id 或 user_id。缺省时使用飞书默认值。
     user_id_type: Option<String>,
     /// 排序方式：ByCreateTimeAsc 或 ByActiveTimeDesc。
@@ -204,6 +238,8 @@ struct FeishuChatListQuery {
 #[derive(Debug, Default, Deserialize, Serialize, ToParameters, ToSchema)]
 #[salvo(parameters(default_parameter_in = Query))]
 struct FeishuChatMembersQuery {
+    /// 使用指定项目绑定的飞书应用；不传时使用全局应用。
+    project_id: Option<i64>,
     /// 成员 ID 类型：open_id、union_id 或 user_id。缺省时使用飞书默认值。
     member_id_type: Option<String>,
     /// 单页数量，范围 1..=100，飞书默认 20。
@@ -222,6 +258,8 @@ struct FeishuChatPath {
 #[derive(Debug, Default, Deserialize, Serialize, ToParameters, ToSchema)]
 #[salvo(parameters(default_parameter_in = Query))]
 struct FeishuBitableTablesQuery {
+    /// 使用指定项目绑定的飞书应用；不传时使用全局应用。
+    project_id: Option<i64>,
     /// 飞书知识库多维表或普通多维表链接，也兼容 Markdown 链接文本。
     url: String,
     /// 飞书上一页响应返回的分页标记。
@@ -394,10 +432,59 @@ pub struct MasterProjectAccountDto {
 pub struct MasterProjectDetailDto {
     #[serde(flatten)]
     pub project: MasterProjectDto,
+    pub feishu_app: ProjectFeishuAppBindingDto,
     pub notification: ProjectNotificationDto,
     pub accounts: Vec<MasterProjectAccountDto>,
     pub auditors: Vec<ProjectAuditorDto>,
     pub periods: Vec<ActivityAdminDto>,
+}
+
+/// 飞书开放平台应用元数据。APP_SECRET 及其密文永不通过接口返回。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct FeishuAppDto {
+    pub feishu_app_id: i64,
+    pub app_id: String,
+    pub display_name: String,
+    pub secret_configured: bool,
+    pub is_active: bool,
+    pub project_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ProjectFeishuAppBindingDto {
+    pub project_id: i64,
+    pub uses_global_fallback: bool,
+    pub app: Option<FeishuAppDto>,
+    pub bound_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// 创建飞书开放平台应用。APP_SECRET 只在本次请求中接收，随后加密保存。
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct CreateFeishuAppRequest {
+    app_id: String,
+    app_secret: String,
+    display_name: String,
+}
+
+/// 完整替换应用配置；轮换 APP_SECRET 时也使用该接口。
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct ReplaceFeishuAppRequest {
+    app_id: String,
+    app_secret: String,
+    display_name: String,
+    #[serde(default = "default_true")]
+    is_active: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct BindProjectFeishuAppRequest {
+    feishu_app_id: i64,
 }
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
@@ -704,6 +791,138 @@ async fn update_master_project(
     Ok(Json(
         fetch_master_project_detail(&state.pool, path.project_id).await?,
     ))
+}
+
+#[endpoint(tags("admin"), summary = "查询飞书开放平台应用列表")]
+async fn list_feishu_apps(
+    query: FeishuAppListQuery,
+    depot: &mut Depot,
+) -> ApiResult<Vec<FeishuAppDto>> {
+    let state = state_from_depot(depot)?;
+    let apps = state
+        .workflow
+        .project_lark
+        .list(query.include_inactive.unwrap_or(true))
+        .await
+        .map_err(map_feishu_app_error)?;
+    Ok(Json(apps.into_iter().map(feishu_app_dto).collect()))
+}
+
+#[endpoint(tags("admin"), summary = "查询飞书开放平台应用")]
+async fn get_feishu_app(path: FeishuAppPath, depot: &mut Depot) -> ApiResult<FeishuAppDto> {
+    let state = state_from_depot(depot)?;
+    let app = state
+        .workflow
+        .project_lark
+        .get(path.feishu_app_id)
+        .await
+        .map_err(map_feishu_app_error)?
+        .ok_or_else(|| ApiError::not_found("飞书应用不存在"))?;
+    Ok(Json(feishu_app_dto(app)))
+}
+
+#[endpoint(tags("admin"), summary = "创建飞书开放平台应用并加密保存密钥")]
+async fn create_feishu_app(
+    body: RequiredJsonBody<CreateFeishuAppRequest>,
+    depot: &mut Depot,
+) -> ApiResult<FeishuAppDto> {
+    let state = state_from_depot(depot)?;
+    let body = body.into_inner();
+    validate_feishu_app_input(&body.app_id, &body.app_secret, &body.display_name)?;
+    let app = state
+        .workflow
+        .project_lark
+        .create(&body.app_id, &body.app_secret, &body.display_name)
+        .await
+        .map_err(map_feishu_app_error)?;
+    Ok(Json(feishu_app_dto(app)))
+}
+
+#[endpoint(tags("admin"), summary = "替换飞书开放平台应用并轮换密钥")]
+async fn replace_feishu_app(
+    path: FeishuAppPath,
+    body: RequiredJsonBody<ReplaceFeishuAppRequest>,
+    depot: &mut Depot,
+) -> ApiResult<FeishuAppDto> {
+    let state = state_from_depot(depot)?;
+    let body = body.into_inner();
+    validate_feishu_app_input(&body.app_id, &body.app_secret, &body.display_name)?;
+    let app = state
+        .workflow
+        .project_lark
+        .replace(
+            path.feishu_app_id,
+            &body.app_id,
+            &body.app_secret,
+            &body.display_name,
+            body.is_active,
+        )
+        .await
+        .map_err(map_feishu_app_error)?
+        .ok_or_else(|| ApiError::not_found("飞书应用不存在"))?;
+    Ok(Json(feishu_app_dto(app)))
+}
+
+#[endpoint(tags("admin"), summary = "查询项目绑定的飞书应用")]
+async fn get_project_feishu_app(
+    path: ProjectPath,
+    depot: &mut Depot,
+) -> ApiResult<ProjectFeishuAppBindingDto> {
+    let state = state_from_depot(depot)?;
+    ensure_project_exists(&state.pool, path.project_id).await?;
+    let binding = state
+        .workflow
+        .project_lark
+        .get_project_binding(path.project_id)
+        .await
+        .map_err(map_feishu_app_error)?;
+    Ok(Json(project_feishu_app_binding_dto(
+        path.project_id,
+        binding,
+    )))
+}
+
+#[endpoint(tags("admin"), summary = "绑定项目与飞书开放平台应用")]
+async fn bind_project_feishu_app(
+    path: ProjectPath,
+    body: RequiredJsonBody<BindProjectFeishuAppRequest>,
+    depot: &mut Depot,
+) -> ApiResult<ProjectFeishuAppBindingDto> {
+    let state = state_from_depot(depot)?;
+    ensure_project_exists(&state.pool, path.project_id).await?;
+    let body = body.into_inner();
+    if body.feishu_app_id <= 0 {
+        return Err(ApiError::bad_request("feishu_app_id 必须大于 0"));
+    }
+    let binding = state
+        .workflow
+        .project_lark
+        .bind_project(path.project_id, body.feishu_app_id)
+        .await
+        .map_err(map_feishu_app_error)?;
+    Ok(Json(project_feishu_app_binding_dto(
+        path.project_id,
+        Some(binding),
+    )))
+}
+
+#[endpoint(tags("admin"), summary = "解除项目飞书应用绑定并恢复全局兜底")]
+async fn unbind_project_feishu_app(
+    path: ProjectPath,
+    depot: &mut Depot,
+) -> ApiResult<ProjectFeishuAppBindingDto> {
+    let state = state_from_depot(depot)?;
+    ensure_project_exists(&state.pool, path.project_id).await?;
+    if !state
+        .workflow
+        .project_lark
+        .unbind_project(path.project_id)
+        .await
+        .map_err(map_feishu_app_error)?
+    {
+        return Err(ApiError::not_found("该项目尚未绑定飞书应用"));
+    }
+    Ok(Json(project_feishu_app_binding_dto(path.project_id, None)))
 }
 
 #[endpoint(tags("admin"), summary = "查询项目通知配置")]
@@ -1258,10 +1477,17 @@ async fn recall_card_message(
     }
 
     repo.mark_recall_started(&message_id).await?;
-    if let Err(error) = FeishuImClient::new(&state.workflow.lark)
-        .recall_message(&message_id)
-        .await
-    {
+    let lark = match history.project_id {
+        Some(project_id) => {
+            state
+                .workflow
+                .project_lark
+                .client_for_project(project_id)
+                .await?
+        }
+        None => state.workflow.lark.clone(),
+    };
+    if let Err(error) = FeishuImClient::new(&lark).recall_message(&message_id).await {
         let error_detail = format!("{error:#}");
         if let Err(history_error) = repo.mark_recall_failed(&message_id, &error_detail).await {
             tracing::error!(
@@ -1475,11 +1701,11 @@ async fn list_bot_chats(
     depot: &mut Depot,
     res: &mut Response,
 ) -> ApiResult<serde_json::Value> {
+    let project_id = query.project_id;
     let query = build_chat_list_query(query)?;
     let state = state_from_depot(depot)?;
-    let upstream = state
-        .workflow
-        .lark
+    let lark = admin_lark_client(&state.workflow, project_id).await?;
+    let upstream = lark
         .get_openapi_json(&["im", "v1", "chats"], &query)
         .await
         .map_err(ApiError::bad_gateway)?;
@@ -1501,9 +1727,8 @@ async fn list_bitable_tables(
     let mut params = vec![("page_size", "99".to_owned())];
     append_feishu_page_token(&mut params, query.page_token)?;
     let state = state_from_depot(depot)?;
-    let upstream = state
-        .workflow
-        .lark
+    let lark = admin_lark_client(&state.workflow, query.project_id).await?;
+    let upstream = lark
         .get_openapi_json(&["bitable", "v1", "apps", &app_token, "tables"], &params)
         .await
         .map_err(ApiError::bad_gateway)?;
@@ -1523,11 +1748,11 @@ async fn list_chat_members(
     res: &mut Response,
 ) -> ApiResult<serde_json::Value> {
     let chat_id = validate_feishu_chat_id(&path.chat_id)?;
+    let project_id = query.project_id;
     let query = build_chat_members_query(query)?;
     let state = state_from_depot(depot)?;
-    let upstream = state
-        .workflow
-        .lark
+    let lark = admin_lark_client(&state.workflow, project_id).await?;
+    let upstream = lark
         .get_openapi_json(&["im", "v1", "chats", &chat_id, "members"], &query)
         .await
         .map_err(ApiError::bad_gateway)?;
@@ -1895,9 +2120,45 @@ async fn fetch_master_project_detail(
     .bind(project_id)
     .fetch_all(pool)
     .await?;
+    let app_row = sqlx::query(
+        r#"
+        SELECT binding.project_id, binding.created_at AS bound_at,
+            binding.updated_at AS binding_updated_at,
+            app.feishu_app_id, app.app_id, app.display_name, app.encryption_key_id,
+            app.is_active, app.created_at, app.updated_at,
+            (SELECT count(*) FROM xingtu_project_feishu_app_binding item
+             WHERE item.feishu_app_id = app.feishu_app_id) AS project_count
+        FROM xingtu_project_feishu_app_binding binding
+        JOIN xingtu_feishu_app app ON app.feishu_app_id = binding.feishu_app_id
+        WHERE binding.project_id = $1
+        "#,
+    )
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+    let app_binding = app_row
+        .map(|row| {
+            Ok::<_, sqlx::Error>(ProjectFeishuAppBinding {
+                project_id: row.try_get("project_id")?,
+                bound_at: row.try_get("bound_at")?,
+                binding_updated_at: row.try_get("binding_updated_at")?,
+                app: FeishuAppMetadata {
+                    feishu_app_id: row.try_get("feishu_app_id")?,
+                    app_id: row.try_get("app_id")?,
+                    display_name: row.try_get("display_name")?,
+                    encryption_key_id: row.try_get("encryption_key_id")?,
+                    is_active: row.try_get("is_active")?,
+                    project_count: row.try_get("project_count")?,
+                    created_at: row.try_get("created_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                },
+            })
+        })
+        .transpose()?;
 
     Ok(MasterProjectDetailDto {
         project: master_project_from_row(project_row)?,
+        feishu_app: project_feishu_app_binding_dto(project_id, app_binding),
         notification: fetch_project_notification(pool, project_id).await?,
         accounts: account_rows
             .into_iter()
@@ -1927,6 +2188,105 @@ fn master_project_from_row(row: PgRow) -> Result<MasterProjectDto, sqlx::Error> 
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+fn feishu_app_dto(app: FeishuAppMetadata) -> FeishuAppDto {
+    FeishuAppDto {
+        feishu_app_id: app.feishu_app_id,
+        app_id: app.app_id,
+        display_name: app.display_name,
+        secret_configured: true,
+        is_active: app.is_active,
+        project_count: app.project_count,
+        created_at: app.created_at,
+        updated_at: app.updated_at,
+    }
+}
+
+fn project_feishu_app_binding_dto(
+    project_id: i64,
+    binding: Option<ProjectFeishuAppBinding>,
+) -> ProjectFeishuAppBindingDto {
+    match binding {
+        Some(binding) => ProjectFeishuAppBindingDto {
+            project_id,
+            uses_global_fallback: false,
+            app: Some(feishu_app_dto(binding.app)),
+            bound_at: Some(binding.bound_at),
+            updated_at: Some(binding.binding_updated_at),
+        },
+        None => ProjectFeishuAppBindingDto {
+            project_id,
+            uses_global_fallback: true,
+            app: None,
+            bound_at: None,
+            updated_at: None,
+        },
+    }
+}
+
+fn validate_feishu_app_input(
+    app_id: &str,
+    app_secret: &str,
+    display_name: &str,
+) -> Result<(), ApiError> {
+    required_text(app_id, "app_id")?;
+    required_text(app_secret, "app_secret")?;
+    required_text(display_name, "display_name")?;
+    if app_id.trim().len() > 255 || display_name.trim().len() > 255 {
+        return Err(ApiError::bad_request(
+            "app_id 和 display_name 长度不能超过 255",
+        ));
+    }
+    if app_secret.trim().len() > 4096 {
+        return Err(ApiError::bad_request("app_secret 长度不能超过 4096"));
+    }
+    Ok(())
+}
+
+async fn admin_lark_client(
+    workflow: &XingtuWorkflowService,
+    project_id: Option<i64>,
+) -> Result<LarkClient, ApiError> {
+    match project_id {
+        Some(project_id) if project_id <= 0 => Err(ApiError::bad_request("project_id 必须大于 0")),
+        Some(project_id) => workflow
+            .project_lark
+            .client_for_project(project_id)
+            .await
+            .map_err(map_feishu_app_error),
+        None => Ok(workflow.lark.clone()),
+    }
+}
+
+fn map_feishu_app_error(error: anyhow::Error) -> ApiError {
+    if let Some(sqlx_error) = error.downcast_ref::<sqlx::Error>()
+        && sqlx_error
+            .as_database_error()
+            .is_some_and(|database_error| database_error.is_unique_violation())
+    {
+        return ApiError::conflict("该飞书 APP_ID 已存在");
+    }
+    let message = error.to_string();
+    if message.contains("飞书应用不存在") {
+        ApiError::not_found(message)
+    } else if message.contains("飞书应用已停用") {
+        ApiError::conflict(message)
+    } else {
+        ApiError::internal(format!("{error:#}"))
+    }
+}
+
+async fn ensure_project_exists(pool: &PgPool, project_id: i64) -> Result<(), ApiError> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM xingtu_project WHERE project_id = $1)")
+            .bind(project_id)
+            .fetch_one(pool)
+            .await?;
+    if !exists {
+        return Err(ApiError::not_found("主项目不存在"));
+    }
+    Ok(())
 }
 
 fn master_project_account_from_row(row: PgRow) -> Result<MasterProjectAccountDto, sqlx::Error> {
@@ -2412,9 +2772,12 @@ mod tests {
             "/api/v1/admin/feishu/chats",
             "/api/v1/admin/feishu/chats/{chat_id}/members",
             "/api/v1/admin/feishu/bitable/tables",
+            "/api/v1/admin/feishu/apps",
+            "/api/v1/admin/feishu/apps/{feishu_app_id}",
             "/api/v1/admin/projects",
             "/api/v1/admin/projects/{project_id}",
             "/api/v1/admin/projects/{project_id}/notification",
+            "/api/v1/admin/projects/{project_id}/feishu-app",
             "/api/v1/admin/projects/{project_id}/accounts",
             "/api/v1/admin/projects/{project_id}/accounts/{xingtu_account_id}",
             "/api/v1/admin/projects/{project_id}/auditors",
@@ -2504,8 +2867,28 @@ mod tests {
     }
 
     #[test]
+    fn feishu_app_response_never_serializes_secret_or_key_id() {
+        let value = serde_json::to_value(FeishuAppDto {
+            feishu_app_id: 1,
+            app_id: "cli_example".to_owned(),
+            display_name: "测试应用".to_owned(),
+            secret_configured: true,
+            is_active: true,
+            project_count: 2,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        let text = value.to_string();
+        assert!(!text.contains("app_secret"));
+        assert!(!text.contains("encrypted"));
+        assert!(!text.contains("encryption_key_id"));
+    }
+
+    #[test]
     fn feishu_chat_list_query_only_accepts_official_values() {
         let params = build_chat_list_query(FeishuChatListQuery {
+            project_id: None,
             user_id_type: Some("union_id".to_owned()),
             sort_type: Some("ByActiveTimeDesc".to_owned()),
             page_size: Some(100),
@@ -2549,6 +2932,7 @@ mod tests {
     fn feishu_chat_member_query_supports_user_and_union_ids() {
         for member_id_type in ["open_id", "user_id", "union_id"] {
             let params = build_chat_members_query(FeishuChatMembersQuery {
+                project_id: None,
                 member_id_type: Some(member_id_type.to_owned()),
                 page_size: Some(50),
                 page_token: None,

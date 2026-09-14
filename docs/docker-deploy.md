@@ -35,6 +35,9 @@ metadata，例如 `0.2.0+build.20260806T010203Z.git.fa2eb7ca7c9e`。发布脚本
 DATABASE_URL=postgres://user:password@host:5432/database
 LARK_APP_ID=cli_xxx
 LARK_APP_SECRET=xxx
+# 推荐为项目级飞书应用凭据配置独立的 32 字节标准 Base64 根密钥。
+LARK_PROJECT_CREDENTIAL_ENCRYPTION_KEY=replace-with-32-byte-standard-base64-key
+LARK_PROJECT_CREDENTIAL_ENCRYPTION_KEY_ID=primary
 MUTATION_API_TOKEN=replace-with-a-long-random-secret
 # 使用星图同步插件时必填；插件包共用，只授权上传登录态。
 XINGTU_SESSION_UPLOAD_TOKEN=replace-with-a-different-long-random-secret
@@ -91,6 +94,13 @@ XINGTU_USER_AGENT=Mozilla/5.0 ...
 `XINGTU_SESSION_ENCRYPTION_KEY` 必须为规范标准 Base64，解码后恰好 32 字节。它是必填项；
 如果未单独配置，服务会回退使用 `API_DATA_ENCRYPTION_KEY`。登录态以 AES-256-GCM 信封密文
 写入 PostgreSQL，账号 ID 参与完整性校验；历史明文会在启动恢复后自动重写为密文。
+
+`LARK_PROJECT_CREDENTIAL_ENCRYPTION_KEY` 用于加密管理接口保存的项目级飞书 APP_SECRET。
+推荐与其他根密钥分开配置；未配置时依次回退 `API_DATA_ENCRYPTION_KEY` 和
+`XINGTU_SESSION_ENCRYPTION_KEY`。密钥 ID 必须与数据库密文记录一致。轮换前应在受控位置准备好
+各应用的新 APP_SECRET；切换新密钥及 ID 后，通过应用替换接口逐个重新保存。尚未重新保存的应用
+会明确拒绝解密，期间应暂停对应工作流。确认全部应用更新完成前必须保留旧密钥备份。该根密钥
+不能提供给前端。
 
 `XINGTU_SESSION_UPLOAD_TOKEN` 在使用内部浏览器插件时是必填项，所有插件包可以共用同一个值；
 它只能上传登录态，不能触发工作流或访问管理接口。不要把它设置成

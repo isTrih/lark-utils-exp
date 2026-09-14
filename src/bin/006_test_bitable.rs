@@ -25,6 +25,7 @@ fn build_current_workflow_config() -> anyhow::Result<DailyMorningReviewWorkflowC
     Ok(DailyMorningReviewWorkflowConfig {
         sync_activities: vec![
             ActivitySyncConfig {
+                project_id: 0,
                 period: "6月第十三期".to_string(),
                 live: Some(table_sync_config(
                     "https://example.feishu.cn/wiki/ExampleBitableOne",
@@ -42,6 +43,7 @@ fn build_current_workflow_config() -> anyhow::Result<DailyMorningReviewWorkflowC
                 )),
             },
             ActivitySyncConfig {
+                project_id: 0,
                 period: "7月第十四期".to_string(),
                 live: Some(table_sync_config(
                     "https://example.feishu.cn/base/ExampleBitableTwo?table=tblExampleVideoMain2&view=vewKYQsbpI",
@@ -60,6 +62,7 @@ fn build_current_workflow_config() -> anyhow::Result<DailyMorningReviewWorkflowC
             },
         ],
         audit_notice: Some(AuditNoticeWorkflowConfig {
+            project_id: 0,
             receiver: MessageReceiver {
                 receive_id_type: ReceiveIdType::ChatId,
                 receive_id: "oc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),

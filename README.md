@@ -93,8 +93,8 @@ cargo run --bin server
 | 变量 | 必需性 | 说明 |
 | --- | --- | --- |
 | `DATABASE_URL` | 必需 | PostgreSQL 连接串。服务启动时连接数据库并执行 migration。 |
-| `LARK_APP_ID` | 必需 | 飞书应用 App ID。 |
-| `LARK_APP_SECRET` | 必需 | 飞书应用 App Secret，只能由服务端注入。 |
+| `LARK_APP_ID` | 必需 | 全局兜底飞书应用 App ID；未绑定独立应用的项目使用它。 |
+| `LARK_APP_SECRET` | 必需 | 全局兜底飞书应用 App Secret，只能由服务端注入。 |
 | `LARK_BASE_URL` | 可选 | 默认 `https://open.feishu.cn`。 |
 | `SERVER_BIND_ADDR` | 可选 | 默认 `0.0.0.0:8080`。 |
 | `TZ` | 推荐 | Docker 示例使用 `Asia/Shanghai`；业务日期仍由程序显式按北京时间计算。 |
@@ -110,6 +110,8 @@ cargo run --bin server
 | `XINGTU_SESSION_UPLOAD_TOKEN` | 使用插件时必需 | 插件共享上传 Token，只允许上传登录态。 |
 | `XINGTU_SESSION_ENCRYPTION_KEY` | 必需 | 标准 Base64，解码后恰好 32 字节；用于 AES-256-GCM 加密数据库中的星图登录态。 |
 | `XINGTU_SESSION_ENCRYPTION_KEY_ID` | 可选 | 登录态密钥标识，默认 `primary`。 |
+| `LARK_PROJECT_CREDENTIAL_ENCRYPTION_KEY` | 推荐 | 项目级飞书 APP_SECRET 的 AES-256-GCM 根密钥；标准 Base64，解码后恰好 32 字节。未配置时回退 API 数据密钥或星图登录态密钥。 |
+| `LARK_PROJECT_CREDENTIAL_ENCRYPTION_KEY_ID` | 可选 | 项目级飞书凭据密钥标识，默认跟随回退密钥 ID 或 `primary`。 |
 | `API_DATA_ENCRYPTION_KEY` | 可选 | 受保护 API JSON 响应的 32 字节标准 Base64 密钥，也可作为登录态密钥的显式回退。 |
 | `API_DATA_ENCRYPTION_KEY_ID` | 可选 | API 数据保护密钥标识，默认 `primary`。 |
 

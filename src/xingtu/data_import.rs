@@ -171,6 +171,16 @@ impl XingtuDataImportRepository {
         limit: i64,
         activity_period_id: Option<i64>,
     ) -> anyhow::Result<Vec<PendingFeishuSource>> {
+        self.list_pending_feishu_sources_for_project(limit, activity_period_id, None)
+            .await
+    }
+
+    pub async fn list_pending_feishu_sources_for_project(
+        &self,
+        limit: i64,
+        activity_period_id: Option<i64>,
+        project_id: Option<i64>,
+    ) -> anyhow::Result<Vec<PendingFeishuSource>> {
         let rows = sqlx::query(
             r#"
             SELECT
@@ -186,6 +196,8 @@ impl XingtuDataImportRepository {
             FROM xingtu_feishu_source s
             JOIN xingtu_activity_content_config c
                 ON c.content_config_id = s.content_config_id
+            JOIN xingtu_activity_period p
+                ON p.activity_period_id = c.activity_period_id
             WHERE
                 s.is_imported = false
                 AND s.import_status IN ('pending', 'failed')
@@ -193,6 +205,7 @@ impl XingtuDataImportRepository {
                 AND s.dead_letter_at IS NULL
                 AND (s.next_retry_at IS NULL OR s.next_retry_at <= now())
                 AND ($2::bigint IS NULL OR c.activity_period_id = $2)
+                AND ($3::bigint IS NULL OR p.project_id = $3)
             ORDER BY
                 CASE s.import_status
                     WHEN 'pending' THEN 0
@@ -205,6 +218,7 @@ impl XingtuDataImportRepository {
         )
         .bind(limit.max(1))
         .bind(activity_period_id)
+        .bind(project_id)
         .fetch_all(&self.pool)
         .await
         .context("查询待导入飞书来源失败")?;
@@ -224,6 +238,50 @@ impl XingtuDataImportRepository {
                 })
             })
             .collect()
+    }
+
+    /// 返回当前待导入来源涉及的项目，供工作流选择对应飞书应用。
+    pub async fn list_pending_project_ids(
+        &self,
+        activity_period_id: Option<i64>,
+    ) -> anyhow::Result<Vec<i64>> {
+        Ok(sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT period.project_id
+            FROM xingtu_feishu_source source
+            JOIN xingtu_activity_content_config content
+                ON content.content_config_id = source.content_config_id
+            JOIN xingtu_activity_period period
+                ON period.activity_period_id = content.activity_period_id
+            WHERE source.is_imported = false
+                AND source.ignored_at IS NULL
+                AND ($1::bigint IS NULL OR period.activity_period_id = $1)
+            ORDER BY period.project_id
+            "#,
+        )
+        .bind(activity_period_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn project_id_for_source(
+        &self,
+        feishu_source_id: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            r#"
+            SELECT period.project_id
+            FROM xingtu_feishu_source source
+            JOIN xingtu_activity_content_config content
+                ON content.content_config_id = source.content_config_id
+            JOIN xingtu_activity_period period
+                ON period.activity_period_id = content.activity_period_id
+            WHERE source.feishu_source_id = $1
+            "#,
+        )
+        .bind(feishu_source_id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     async fn get_pending_feishu_source(
@@ -1184,6 +1242,26 @@ pub async fn import_pending_feishu_sources(
         process_pending_source(repo, lark, &source, &mut summary).await?;
     }
 
+    Ok(summary)
+}
+
+pub async fn import_pending_feishu_sources_for_project(
+    repo: &XingtuDataImportRepository,
+    lark: &LarkClient,
+    limit: i64,
+    activity_period_id: Option<i64>,
+    project_id: i64,
+) -> anyhow::Result<PendingImportResult> {
+    let pending_sources = repo
+        .list_pending_feishu_sources_for_project(limit, activity_period_id, Some(project_id))
+        .await?;
+    let mut summary = PendingImportResult {
+        discovered_sources: pending_sources.len(),
+        ..PendingImportResult::default()
+    };
+    for source in pending_sources {
+        process_pending_source(repo, lark, &source, &mut summary).await?;
+    }
     Ok(summary)
 }
 

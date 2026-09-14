@@ -94,6 +94,7 @@ pub struct ActivityAuditTableConfig {
 /// 从审核表回写数据库所需的最小配置。
 #[derive(Debug, Clone)]
 pub struct ActivityAuditResultSyncConfig {
+    pub project_id: i64,
     pub period: String,
     pub content_config_id: i64,
     pub content_type: XingtuContentType,
@@ -121,6 +122,7 @@ pub struct ActivityAuditNoticeConfig {
 /// - 审核结果字段名默认是 `审核结果`，字段变化时也可以覆盖
 #[derive(Debug, Clone)]
 pub struct AuditNoticeWorkflowConfig {
+    pub project_id: i64,
     pub receiver: MessageReceiver,
     pub card_template_id: String,
     pub auditor_ids: String,
@@ -139,6 +141,7 @@ impl AuditNoticeWorkflowConfig {
         activities: Vec<ActivityAuditNoticeConfig>,
     ) -> Self {
         Self {
+            project_id: 0,
             receiver,
             card_template_id: card_template_id.into(),
             auditor_ids: auditor_ids.into(),
@@ -155,6 +158,7 @@ impl AuditNoticeWorkflowConfig {
 /// 当前 006 测试入口会手动构造它，模拟调度器触发。
 #[derive(Debug, Clone, Default)]
 pub struct ActivitySyncConfig {
+    pub project_id: i64,
     pub period: String,
     pub live: Option<ActivityTableSyncConfig>,
     pub video: Option<ActivityTableSyncConfig>,

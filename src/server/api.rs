@@ -167,8 +167,14 @@ async fn send_project_report(
         .ok_or_else(|| {
             ApiError::not_found(format!("当前启用项目不存在：{}", path.activity_period_id))
         })?;
+    let project_lark = state
+        .workflow
+        .project_lark
+        .client_for_project(context.project_id)
+        .await?;
+    let context_project_id = context.project_id;
     let result = project_report::send_project_report(
-        &state.workflow.lark,
+        &project_lark,
         context,
         mission,
         body.hot_videos.as_deref(),
@@ -192,6 +198,7 @@ async fn send_project_report(
             ),
             &receiver,
             Some(&result.project),
+            Some(context_project_id),
             Some(result.activity_period_id),
         )
         .await;

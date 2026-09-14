@@ -63,7 +63,7 @@ pub struct StoredXingtuSession {
 }
 
 /// 星图账号和登录态仓储。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct XingtuAccountRepository {
     pool: PgPool,
     cipher: SessionCipher,

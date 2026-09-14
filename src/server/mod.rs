@@ -15,7 +15,8 @@ pub mod state;
 use crate::client::LarkClient;
 use crate::config::{Config, DatabaseConfig};
 use crate::lark::message_history::CardMessageHistoryRepository;
-use crate::server::secret_store::SessionCipher;
+use crate::lark::project_app::ProjectFeishuAppStore;
+use crate::server::secret_store::{ProjectFeishuCredentialCipher, SessionCipher};
 use crate::server::state::AppState;
 use crate::workflow::XingtuWorkflowService;
 use crate::workflow_run::WorkflowRunRepository;
@@ -58,7 +59,14 @@ pub async fn build_app_state() -> anyhow::Result<Arc<AppState>> {
         .await
         .context("执行数据库 migration 失败")?;
 
-    let lark = LarkClient::new(Config::from_env()?)?;
+    let lark_config = Config::from_env()?;
+    let lark = LarkClient::new(lark_config.clone())?;
+    let project_lark = ProjectFeishuAppStore::new(
+        pool.clone(),
+        ProjectFeishuCredentialCipher::from_env()?,
+        lark_config,
+        lark.clone(),
+    );
     let activity_repo = XingtuActivityConfigRepository::new(pool.clone());
     let data_import_repo = XingtuDataImportRepository::new(pool.clone());
     let account_repo = XingtuAccountRepository::new(pool.clone(), SessionCipher::from_env()?);
@@ -77,6 +85,7 @@ pub async fn build_app_state() -> anyhow::Result<Arc<AppState>> {
         workflow_run_repo,
         session_registry,
         lark,
+        project_lark,
     );
     let restored_sessions = workflow
         .restore_sessions_from_db()

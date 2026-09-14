@@ -18,6 +18,8 @@ pub fn routes() -> Router {
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 struct FormatAnalysisSpreadsheetRequest {
+    /// 使用指定项目绑定的飞书应用；不传时使用全局应用。
+    project_id: Option<i64>,
     /// 飞书普通电子表格链接，支持 /sheets/ 和带 sheet 参数的 /wiki/ 链接。
     url: String,
     /// 仅分析而不回写；默认 false。
@@ -51,10 +53,21 @@ async fn format_analysis_spreadsheet(
     let location = parse_spreadsheet_location(&body.url)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let state = state_from_depot(depot)?;
+    let lark = match body.project_id {
+        Some(project_id) if project_id <= 0 => {
+            return Err(ApiError::bad_request("project_id 必须大于 0"));
+        }
+        Some(project_id) => {
+            state
+                .workflow
+                .project_lark
+                .client_for_project(project_id)
+                .await?
+        }
+        None => state.workflow.lark.clone(),
+    };
 
-    let read = state
-        .workflow
-        .lark
+    let read = lark
         .get_openapi_json(
             &[
                 "sheets",
@@ -82,9 +95,7 @@ async fn format_analysis_spreadsheet(
         let total_batches = writes.len().div_ceil(WRITE_BATCH_SIZE);
         for (batch_index, batch) in writes.chunks(WRITE_BATCH_SIZE).enumerate() {
             let payload = build_batch_write_payload(batch);
-            let write = state
-                .workflow
-                .lark
+            let write = lark
                 .post_openapi_json(
                     &[
                         "sheets",

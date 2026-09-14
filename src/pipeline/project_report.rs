@@ -20,6 +20,7 @@ const PROJECT_REPORT_WITH_HOT_VIDEOS_TEMPLATE_ENV: &str =
 /// 项目汇报卡片所需的数据库上下文。
 #[derive(Debug, Clone)]
 pub struct ProjectReportContext {
+    pub project_id: i64,
     pub activity_period_id: i64,
     pub project: String,
     pub period: String,
@@ -60,6 +61,7 @@ pub async fn load_project_report_context(
         r#"
         WITH period_context AS (
             SELECT
+                p.project_id,
                 p.activity_period_id,
                 project.display_name AS project,
                 p.period,
@@ -113,6 +115,7 @@ pub async fn load_project_report_context(
                 AND ls.start_time < (p.task_month + INTERVAL '1 month')::timestamp
         )
         SELECT
+            p.project_id,
             p.activity_period_id,
             p.project,
             p.period,
@@ -131,6 +134,7 @@ pub async fn load_project_report_context(
 
     row.map(|row| {
         Ok(ProjectReportContext {
+            project_id: row.try_get("project_id")?,
             activity_period_id: row.try_get("activity_period_id")?,
             project: row.try_get("project")?,
             period: row.try_get("period")?,
@@ -322,6 +326,7 @@ mod tests {
     fn project_report_card_uses_expected_template_variables() {
         const TEST_TEMPLATE_ID: &str = "example-hot-video-template-id";
         let context = ProjectReportContext {
+            project_id: 1,
             activity_period_id: 1,
             project: "ROK".to_string(),
             period: "2026年7月第十四期".to_string(),

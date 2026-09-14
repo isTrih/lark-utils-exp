@@ -197,6 +197,7 @@ pub struct FeishuSourceInsertOptions<'a> {
 /// 自动工作流中的单个活动执行范围。
 #[derive(Debug, Clone)]
 pub struct WorkflowActivityScope {
+    pub project_id: i64,
     pub activity_period_id: i64,
     pub xingtu_account_id: String,
 }
@@ -204,6 +205,7 @@ pub struct WorkflowActivityScope {
 /// 从数据库读取出来的一条同步内容配置。
 #[derive(Debug, Clone)]
 struct SyncableContentConfig {
+    project_id: i64,
     activity_period_id: i64,
     content_config_id: i64,
     period: String,
@@ -347,6 +349,7 @@ impl XingtuActivityConfigRepository {
         let rows = sqlx::query(
             r#"
             SELECT
+                p.project_id,
                 p.activity_period_id,
                 p.xingtu_account_id,
                 p.tracking_start_date,
@@ -376,6 +379,7 @@ impl XingtuActivityConfigRepository {
             let tracking_end_date: Option<NaiveDate> = row.try_get("tracking_end_date")?;
             if tracking_window_includes(run_at, tracking_start_date, tracking_end_date) {
                 activity_scopes.push(WorkflowActivityScope {
+                    project_id: row.try_get("project_id")?,
                     activity_period_id: row.try_get("activity_period_id")?,
                     xingtu_account_id: row.try_get("xingtu_account_id")?,
                 });
@@ -439,6 +443,7 @@ impl XingtuActivityConfigRepository {
                 let index = activities.len();
                 period_to_index.insert(content.activity_period_id, index);
                 activities.push(ActivitySyncConfig {
+                    project_id: content.project_id,
                     period: content.period.clone(),
                     live: None,
                     video: None,
@@ -469,6 +474,7 @@ impl XingtuActivityConfigRepository {
         let rows = sqlx::query(
             r#"
             SELECT
+                p.project_id,
                 p.period,
                 p.bitable_url,
                 project.audit_result_field,
@@ -496,6 +502,7 @@ impl XingtuActivityConfigRepository {
             .map(|row| {
                 let content_type: String = row.try_get("content_type")?;
                 Ok(ActivityAuditResultSyncConfig {
+                    project_id: row.try_get("project_id")?,
                     period: row.try_get("period")?,
                     content_config_id: row.try_get("content_config_id")?,
                     content_type: parse_content_type(&content_type)?,
@@ -586,6 +593,7 @@ impl XingtuActivityConfigRepository {
                     .await
                     .with_context(|| format!("查询项目审核人失败：{project}"))?;
                 configs.push(AuditNoticeWorkflowConfig {
+                    project_id,
                     receiver: crate::lark::im::MessageReceiver {
                         receive_id_type: crate::lark::im::parse_receive_id_type(&receive_id_type)?,
                         receive_id: project_group_id,
@@ -668,6 +676,7 @@ impl XingtuActivityConfigRepository {
         let rows = sqlx::query(
             r#"
             SELECT
+                p.project_id,
                 p.activity_period_id,
                 c.content_config_id,
                 p.period,
@@ -743,6 +752,7 @@ impl XingtuActivityConfigRepository {
 
             let content_type: String = row.try_get("content_type")?;
             contents.push(SyncableContentConfig {
+                project_id: row.try_get("project_id")?,
                 activity_period_id: row.try_get("activity_period_id")?,
                 content_config_id: row.try_get("content_config_id")?,
                 period: row.try_get("period")?,

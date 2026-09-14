@@ -689,6 +689,15 @@ PATCH /api/v1/admin/projects/{project_id}
 GET   /api/v1/admin/projects/{project_id}/notification
 PATCH /api/v1/admin/projects/{project_id}/notification
 
+GET    /api/v1/admin/projects/{project_id}/feishu-app
+PUT    /api/v1/admin/projects/{project_id}/feishu-app
+DELETE /api/v1/admin/projects/{project_id}/feishu-app
+
+GET  /api/v1/admin/feishu/apps
+POST /api/v1/admin/feishu/apps
+GET  /api/v1/admin/feishu/apps/{feishu_app_id}
+PUT  /api/v1/admin/feishu/apps/{feishu_app_id}
+
 GET   /api/v1/admin/projects/{project_id}/accounts
 POST  /api/v1/admin/projects/{project_id}/accounts
 PATCH /api/v1/admin/projects/{project_id}/accounts/{xingtu_account_id}
@@ -704,7 +713,47 @@ PUT   /api/v1/admin/projects/{project_id}/periods/{activity_period_id}
 PATCH /api/v1/admin/projects/{project_id}/periods/{activity_period_id}/status
 ```
 
-`GET /projects/{project_id}` 会同时返回 `notification`、`accounts`、`auditors` 和 `periods`。
+### 项目级飞书开放平台应用
+
+一个飞书应用可以绑定多个主项目，一个主项目同时只绑定一个飞书应用。应用凭据只保存一份；
+`APP_SECRET` 使用 AES-256-GCM 加密落库，密文完整性绑定内部应用 ID 与飞书 APP_ID。所有查询响应
+只返回 `secret_configured: true`，不会返回 APP_SECRET 或密文。上述接口均要求
+`Authorization: Bearer <MUTATION_API_TOKEN>`，生产环境还必须使用 HTTPS。
+
+创建应用：
+
+```http
+POST /api/v1/admin/feishu/apps
+Content-Type: application/json
+
+{
+  "app_id": "cli_example",
+  "app_secret": "仅在本次请求传入",
+  "display_name": "生态业务飞书应用"
+}
+```
+
+轮换密钥或更新应用使用 `PUT /api/v1/admin/feishu/apps/{feishu_app_id}`，请求体增加
+`is_active`。完整替换要求再次提供 APP_SECRET，避免出现无法判断“保留旧密钥还是写入空值”的歧义。
+
+绑定项目：
+
+```http
+PUT /api/v1/admin/projects/1/feishu-app
+Content-Type: application/json
+
+{ "feishu_app_id": 2 }
+```
+
+解除绑定后，该项目恢复使用环境变量 `LARK_APP_ID`、`LARK_APP_SECRET` 对应的全局兜底应用。
+工作流中的来源 Sheet 导入、主表与审核表同步、审核/错误通知、日报卡片和消息撤回都会按项目
+选择应用。同一飞书应用绑定多个项目时会共用该应用的 tenant access token 缓存。
+
+管理类飞书接口可增加 `project_id` 查询参数，以指定应用身份：群列表、群成员、多维表数据表枚举。
+电子表格格式化接口则在 JSON 请求体中增加可选 `project_id`。不传时均使用全局兜底应用。
+
+`GET /projects/{project_id}` 会同时返回 `feishu_app`、`notification`、`accounts`、`auditors` 和
+`periods`；未绑定应用时 `feishu_app.uses_global_fallback=true`。
 创建项目时通知配置必填：
 
 ```json

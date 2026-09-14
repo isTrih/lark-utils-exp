@@ -3,9 +3,10 @@ use crate::lark::im::{
     AuditReviewNoticeConfig, FeishuImClient, SendMessageResult, XingtuLoginNoticeConfig,
 };
 use crate::lark::message_history::{CardMessageCategory, CardMessageHistoryRepository};
+use crate::lark::project_app::ProjectFeishuAppStore;
 use crate::pipeline::audit_notice::build_pending_audit_info;
 use crate::pipeline::audit_result_sync::{AuditResultSyncResult, sync_audit_results_to_database};
-use crate::pipeline::workflow::run_activity_sync_workflow;
+use crate::pipeline::workflow::run_activity_sync_workflow_with_client;
 use crate::workflow_run::WorkflowRunRepository;
 use crate::xingtu::account::{
     XingtuAccountRepository, XingtuProjectAccount, XingtuSessionRegistry,
@@ -13,7 +14,7 @@ use crate::xingtu::account::{
 use crate::xingtu::activity_config::XingtuActivityConfigRepository;
 use crate::xingtu::data_import::{
     PendingImportResult, XingtuDataImportRepository, import_feishu_source_by_id,
-    import_pending_feishu_sources,
+    import_pending_feishu_sources_for_project,
 };
 use crate::xingtu::trace::{
     TraceRoundResult, XingtuTraceRunOptions, run_xingtu_trace_once_with_registry,
@@ -27,7 +28,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{Postgres, Transaction};
 use std::time::Duration;
-use std::{collections::BTreeSet, future::Future, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 
 #[derive(Debug)]
@@ -133,6 +138,7 @@ pub struct XingtuWorkflowService {
     pub workflow_run_repo: WorkflowRunRepository,
     pub session_registry: XingtuSessionRegistry,
     pub lark: LarkClient,
+    pub project_lark: ProjectFeishuAppStore,
     write_lock: Arc<Mutex<()>>,
 }
 
@@ -145,6 +151,7 @@ impl XingtuWorkflowService {
         workflow_run_repo: WorkflowRunRepository,
         session_registry: XingtuSessionRegistry,
         lark: LarkClient,
+        project_lark: ProjectFeishuAppStore,
     ) -> Self {
         Self {
             activity_repo,
@@ -154,6 +161,7 @@ impl XingtuWorkflowService {
             workflow_run_repo,
             session_registry,
             lark,
+            project_lark,
             write_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -246,10 +254,17 @@ impl XingtuWorkflowService {
         let mut processed_activity_period_ids = Vec::new();
 
         for activity_scope in activity_scopes {
+            let project_id = activity_scope.project_id;
             let activity_period_id = activity_scope.activity_period_id;
             let xingtu_account_id = activity_scope.xingtu_account_id;
+            let project_lark = self
+                .project_lark
+                .client_for_project(project_id)
+                .await
+                .with_context(|| format!("初始化项目 {project_id} 的飞书客户端失败"))?;
             tracing::info!(
                 workflow = kind.trigger_type(),
+                project_id,
                 activity_period_id,
                 xingtu_account_id,
                 "开始执行项目完整工作流"
@@ -284,11 +299,12 @@ impl XingtuWorkflowService {
 
             let activity_import = self
                 .tracked_step(workflow_run_id, activity_period_id, "pending_import", async {
-                    import_pending_feishu_sources(
+                    import_pending_feishu_sources_for_project(
                         &self.data_import_repo,
-                        &self.lark,
+                        &project_lark,
                         200,
                         Some(activity_period_id),
+                        project_id,
                     )
                     .await
                     .with_context(|| {
@@ -316,7 +332,7 @@ impl XingtuWorkflowService {
                             )
                         })?;
                     let count = activity_configs.len();
-                    run_activity_sync_workflow(activity_configs)
+                    run_activity_sync_workflow_with_client(project_lark.clone(), activity_configs)
                         .await
                         .with_context(|| {
                             format!(
@@ -415,13 +431,29 @@ impl XingtuWorkflowService {
             .await?;
         let result = self
             .tracked_optional_step(run_id, activity_period_id, "pending_import", async {
-                import_pending_feishu_sources(
-                    &self.data_import_repo,
-                    &self.lark,
-                    limit,
-                    activity_period_id,
-                )
-                .await
+                let project_ids = self
+                    .data_import_repo
+                    .list_pending_project_ids(activity_period_id)
+                    .await?;
+                let mut total = PendingImportResult::default();
+                let mut remaining = limit.max(1);
+                for project_id in project_ids {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let lark = self.project_lark.client_for_project(project_id).await?;
+                    let result = import_pending_feishu_sources_for_project(
+                        &self.data_import_repo,
+                        &lark,
+                        remaining,
+                        activity_period_id,
+                        project_id,
+                    )
+                    .await?;
+                    remaining = remaining.saturating_sub(result.discovered_sources as i64);
+                    merge_pending_import_result(&mut total, result);
+                }
+                Ok(total)
             })
             .await;
         self.finish_serializable_run(run_id, &result).await?;
@@ -449,8 +481,13 @@ impl XingtuWorkflowService {
                 {
                     return Err(anyhow!("未找到可重试来源：{feishu_source_id}"));
                 }
-                import_feishu_source_by_id(&self.data_import_repo, &self.lark, feishu_source_id)
-                    .await
+                let project_id = self
+                    .data_import_repo
+                    .project_id_for_source(feishu_source_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("未找到来源所属项目：{feishu_source_id}"))?;
+                let lark = self.project_lark.client_for_project(project_id).await?;
+                import_feishu_source_by_id(&self.data_import_repo, &lark, feishu_source_id).await
             })
             .await;
         self.finish_serializable_run(run_id, &result).await?;
@@ -565,9 +602,19 @@ impl XingtuWorkflowService {
             video_configs = result.video_configs,
             "开始执行手动登记专项同步"
         );
-        run_activity_sync_workflow(activity_configs)
-            .await
-            .context("同步手动登记数据失败")?;
+        let mut configs_by_project = BTreeMap::<i64, Vec<_>>::new();
+        for config in activity_configs {
+            configs_by_project
+                .entry(config.project_id)
+                .or_default()
+                .push(config);
+        }
+        for (project_id, configs) in configs_by_project {
+            let lark = self.project_lark.client_for_project(project_id).await?;
+            run_activity_sync_workflow_with_client(lark, configs)
+                .await
+                .with_context(|| format!("同步项目 {project_id} 的手动登记数据失败"))?;
+        }
         tracing::info!("手动登记专项同步完成");
 
         Ok(result)
@@ -857,7 +904,18 @@ impl XingtuWorkflowService {
             error_detail: error_detail.to_string(),
         };
 
-        match FeishuImClient::new(&self.lark)
+        let project_lark = match self
+            .project_lark
+            .client_for_project(account.project_id)
+            .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::error!(project_id = account.project_id, error = ?error, "初始化项目飞书客户端失败，无法发送错误通知");
+                return None;
+            }
+        };
+        match FeishuImClient::new(&project_lark)
             .send_xingtu_login_notice(&receiver, &notice)
             .await
         {
@@ -870,6 +928,7 @@ impl XingtuWorkflowService {
                         format!("{project_name}：{error_type}"),
                         &receiver,
                         Some(&project_name),
+                        Some(account.project_id),
                         None,
                     )
                     .await;
@@ -908,7 +967,25 @@ impl XingtuWorkflowService {
             .activity_repo
             .list_audit_result_sync_configs(activity_period_id)
             .await?;
-        sync_audit_results_to_database(&self.lark, &self.data_import_repo, configs).await
+        let mut configs_by_project = BTreeMap::<i64, Vec<_>>::new();
+        for config in configs {
+            configs_by_project
+                .entry(config.project_id)
+                .or_default()
+                .push(config);
+        }
+        let mut total = AuditResultSyncResult::default();
+        for (project_id, configs) in configs_by_project {
+            let lark = self.project_lark.client_for_project(project_id).await?;
+            let result = sync_audit_results_to_database(&lark, &self.data_import_repo, configs)
+                .await
+                .with_context(|| format!("同步项目 {project_id} 的审核结果失败"))?;
+            total.tables_processed += result.tables_processed;
+            total.records_read += result.records_read;
+            total.reviewed_records += result.reviewed_records;
+            total.database_rows_updated += result.database_rows_updated;
+        }
+        Ok(total)
     }
 
     async fn run_audit_notice_from_db(
@@ -935,8 +1012,12 @@ impl XingtuWorkflowService {
         let mut audit_notice_sent = false;
 
         for notice_config in notice_configs {
+            let project_lark = self
+                .project_lark
+                .client_for_project(notice_config.project_id)
+                .await?;
             let project_name = notice_config.project_name.clone();
-            let audit_info = build_pending_audit_info(&self.lark, &notice_config)
+            let audit_info = build_pending_audit_info(&project_lark, &notice_config)
                 .await
                 .with_context(|| format!("构建项目 `{project_name}` 审核通知卡片参数失败"))?;
             pending_items.extend(audit_info.iter().map(|item| AuditNoticeItemResult {
@@ -977,7 +1058,7 @@ impl XingtuWorkflowService {
                 notice_config.project_name.trim(),
                 audit_info,
             );
-            let result = FeishuImClient::new(&self.lark)
+            let result = FeishuImClient::new(&project_lark)
                 .send_audit_review_notice(&notice_config.receiver, &card)
                 .await
                 .with_context(|| format!("发送项目 `{project_name}` 审核通知失败"));
@@ -1002,6 +1083,7 @@ impl XingtuWorkflowService {
                     summary,
                     &notice_config.receiver,
                     Some(&project_name),
+                    Some(notice_config.project_id),
                     None,
                 )
                 .await;
