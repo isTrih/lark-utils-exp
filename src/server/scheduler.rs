@@ -5,25 +5,28 @@ use chrono_tz::Asia::Shanghai;
 use std::{sync::Arc, time::Duration};
 use tokio::time::{Instant, sleep_until};
 
+const PERIODIC_TIMES: [NaiveTime; 2] = [
+    NaiveTime::from_hms_opt(12, 0, 0).expect("valid time"),
+    NaiveTime::from_hms_opt(18, 0, 0).expect("valid time"),
+];
+const MORNING_TIME: NaiveTime = NaiveTime::from_hms_opt(9, 0, 0).expect("valid time");
+const NIGHT_TIME: NaiveTime = NaiveTime::from_hms_opt(23, 59, 0).expect("valid time");
+const LOGIN_CHECK_TIME: NaiveTime = NaiveTime::from_hms_opt(0, 30, 0).expect("valid time");
+
 /// 启动内置调度器。
 ///
 /// 生产环境也可以改成由企业后端调度器调用 HTTP 手动执行接口；
 /// 这里先落地服务自带调度，方便独立运行和调试。
 pub fn spawn_scheduler(state: Arc<AppState>) {
     tracing::info!(
-        "内置调度器已启动：periodic 下一次执行 [{}, {}, {}]，morning 下一次执行 {}，night 下一次执行 {}，登录态巡检下一次执行 {}",
-        next_daily_local_time(NaiveTime::from_hms_opt(3, 0, 0).expect("valid time")),
-        next_daily_local_time(NaiveTime::from_hms_opt(15, 0, 0).expect("valid time")),
-        next_daily_local_time(NaiveTime::from_hms_opt(21, 0, 0).expect("valid time")),
-        next_daily_local_time(NaiveTime::from_hms_opt(9, 0, 0).expect("valid time")),
-        next_daily_local_time(NaiveTime::from_hms_opt(23, 59, 0).expect("valid time")),
-        next_daily_local_time(NaiveTime::from_hms_opt(0, 30, 0).expect("valid time")),
+        "内置调度器已启动：periodic 下一次执行 [{}, {}]，morning 下一次执行 {}，night 下一次执行 {}，登录态巡检下一次执行 {}",
+        next_daily_local_time(PERIODIC_TIMES[0]),
+        next_daily_local_time(PERIODIC_TIMES[1]),
+        next_daily_local_time(MORNING_TIME),
+        next_daily_local_time(NIGHT_TIME),
+        next_daily_local_time(LOGIN_CHECK_TIME),
     );
-    for time in [
-        NaiveTime::from_hms_opt(3, 0, 0).expect("valid time"),
-        NaiveTime::from_hms_opt(15, 0, 0).expect("valid time"),
-        NaiveTime::from_hms_opt(21, 0, 0).expect("valid time"),
-    ] {
+    for time in PERIODIC_TIMES {
         tokio::spawn(run_daily_workflow_loop(
             state.clone(),
             WorkflowKind::Periodic,
@@ -33,12 +36,12 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
     tokio::spawn(run_daily_workflow_loop(
         state.clone(),
         WorkflowKind::Morning,
-        NaiveTime::from_hms_opt(9, 0, 0).expect("valid time"),
+        MORNING_TIME,
     ));
     tokio::spawn(run_daily_workflow_loop(
         state.clone(),
         WorkflowKind::Night,
-        NaiveTime::from_hms_opt(23, 59, 0).expect("valid time"),
+        NIGHT_TIME,
     ));
     tokio::spawn(run_login_check_loop(state));
 }
@@ -78,10 +81,7 @@ async fn run_daily_workflow_loop(state: Arc<AppState>, kind: WorkflowKind, time:
 }
 
 async fn run_login_check_loop(state: Arc<AppState>) {
-    sleep_until(next_daily_instant(
-        NaiveTime::from_hms_opt(0, 30, 0).expect("valid time"),
-    ))
-    .await;
+    sleep_until(next_daily_instant(LOGIN_CHECK_TIME)).await;
 
     loop {
         if let Err(error) = state.workflow.check_all_logins().await {
@@ -123,4 +123,22 @@ fn instant_from_utc(target: DateTime<Utc>) -> Instant {
         .to_std()
         .unwrap_or_else(|_| Duration::from_secs(0));
     Instant::now() + duration
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_in_workflow_times_match_business_schedule() {
+        assert_eq!(
+            PERIODIC_TIMES,
+            [
+                NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+                NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
+            ]
+        );
+        assert_eq!(MORNING_TIME, NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+        assert_eq!(NIGHT_TIME, NaiveTime::from_hms_opt(23, 59, 0).unwrap());
+    }
 }

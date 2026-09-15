@@ -32,22 +32,21 @@ pub async fn run_daily_morning_review_workflow(
     Ok(())
 }
 
-/// 每 N 小时同步工作流。
+/// 固定业务时点同步工作流。
 ///
 /// 这是调试用低层入口；生产环境调度由 `server::scheduler` 和
-/// `XingtuWorkflowService` 执行完整链路。`interval_hours` 只用于调试日志。
+/// `XingtuWorkflowService` 在固定业务时点执行完整链路。
 pub async fn run_periodic_sync_workflow(
     activity_configs: Vec<ActivitySyncConfig>,
-    interval_hours: u64,
 ) -> anyhow::Result<()> {
-    tracing::info!("开始执行每 {} 小时同步工作流", interval_hours);
+    tracing::info!("开始执行固定时点同步工作流");
 
     let app_config = Config::from_env().context("读取环境配置失败")?;
     let lark = LarkClient::new(app_config).context("创建 LarkClient 失败")?;
 
     run_sync_data_step(lark, activity_configs).await?;
 
-    tracing::info!("每 {} 小时同步工作流完成", interval_hours);
+    tracing::info!("固定时点同步工作流完成");
     Ok(())
 }
 

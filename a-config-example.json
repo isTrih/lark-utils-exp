@@ -10,8 +10,7 @@
     "tracking_end_date": "2026-02-15",
     "workflows": {
       "morning_workflow_enabled": true,
-      "periodic_sync_enabled": true,
-      "periodic_sync_interval_hours": 2
+      "periodic_sync_enabled": true
     },
     "contents": [
       {

@@ -103,7 +103,6 @@ pub struct ActivityPeriodDto {
     pub need_trace: bool,
     pub morning_review_enabled: bool,
     pub periodic_sync_enabled: bool,
-    pub periodic_sync_interval_hours: i32,
     pub tracking_start_date: Option<NaiveDate>,
     pub tracking_end_date: Option<NaiveDate>,
 }
@@ -513,7 +512,6 @@ pub async fn list_activity_periods(pool: &PgPool) -> anyhow::Result<Vec<Activity
             period.need_trace,
             period.morning_review_enabled,
             period.periodic_sync_enabled,
-            period.periodic_sync_interval_hours,
             period.tracking_start_date,
             period.tracking_end_date
         FROM xingtu_activity_period period
@@ -540,7 +538,6 @@ pub async fn list_activity_periods(pool: &PgPool) -> anyhow::Result<Vec<Activity
                 need_trace: row.try_get("need_trace")?,
                 morning_review_enabled: row.try_get("morning_review_enabled")?,
                 periodic_sync_enabled: row.try_get("periodic_sync_enabled")?,
-                periodic_sync_interval_hours: row.try_get("periodic_sync_interval_hours")?,
                 tracking_start_date: row.try_get("tracking_start_date")?,
                 tracking_end_date: row.try_get("tracking_end_date")?,
             })

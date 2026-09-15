@@ -99,7 +99,7 @@ cargo run --bin server
 | `SERVER_BIND_ADDR` | 可选 | 默认 `0.0.0.0:8080`。 |
 | `TZ` | 推荐 | Docker 示例使用 `Asia/Shanghai`；业务日期仍由程序显式按北京时间计算。 |
 | `RUST_LOG` | 可选 | 默认 `info`。`debug` 会包含较多 HTTP/OpenLark 底层日志。 |
-| `LOG_DIR` | 可选 | 持久化 JSONL 日志目录；Docker 默认 `/app/logs`。 |
+| `LOG_DIR` | 可选 | 持久化 JSONL 日志目录；Docker 默认 `/app/logs`。控制台与文件时间戳均为北京时间并带 `+08:00` 偏移。 |
 | `WORKFLOW_PROJECT_CONCURRENCY` | 可选 | 自动工作流的项目级并发数，默认 `3`，范围 `1-16`；单项目内部仍按顺序执行。 |
 
 ### 鉴权与密钥
@@ -178,11 +178,11 @@ CORS_DOMAIN=example.com,*.example.com
 
 内置调度全部按 `Asia/Shanghai`：
 
-- `periodic`：03:00、15:00、21:00；
+- `periodic`：12:00、18:00；
 - `morning`：09:00；
 - `night`：23:59。
 
-`tracking_end_date` 结束后的北京时间 T+1 03:00 仍会执行最后一次更新，T+1 09:00 起不再拉取。
+`tracking_end_date` 当天北京时间 23:59 执行最后一次更新，次日不再自动拉取。
 
 ## API 与数据安全
 

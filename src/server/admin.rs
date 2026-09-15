@@ -612,7 +612,6 @@ pub struct ActivityAdminDto {
     pub need_trace: bool,
     pub morning_review_enabled: bool,
     pub periodic_sync_enabled: bool,
-    pub periodic_sync_interval_hours: i32,
     pub tracking_start_date: Option<NaiveDate>,
     pub tracking_end_date: Option<NaiveDate>,
     pub is_active: bool,
@@ -1355,8 +1354,7 @@ async fn save_project_period(
             UPDATE xingtu_activity_period SET period=$3, period_code=$4, xingtu_account_id=$5,
                 task_month=$6, bitable_url=$7, cpm_table_id=$8, need_trace=$9,
                 morning_review_enabled=$10, periodic_sync_enabled=$11,
-                periodic_sync_interval_hours=$12, tracking_start_date=$13,
-                tracking_end_date=$14, is_active=$15, remark=$16
+                tracking_start_date=$12, tracking_end_date=$13, is_active=$14, remark=$15
             WHERE project_id=$1 AND activity_period_id=$2 RETURNING activity_period_id
             "#,
         )
@@ -1371,7 +1369,6 @@ async fn save_project_period(
         .bind(body.need_trace)
         .bind(body.workflows.morning_workflow_enabled)
         .bind(body.workflows.periodic_sync_enabled)
-        .bind(body.workflows.periodic_sync_interval_hours)
         .bind(body.tracking_start_date)
         .bind(body.tracking_end_date)
         .bind(body.is_active)
@@ -1385,17 +1382,27 @@ async fn save_project_period(
             INSERT INTO xingtu_activity_period (
                 project_id, period, period_code, xingtu_account_id, task_month, bitable_url,
                 cpm_table_id, need_trace, morning_review_enabled, periodic_sync_enabled,
-                periodic_sync_interval_hours, tracking_start_date, tracking_end_date, is_active, remark
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                tracking_start_date, tracking_end_date, is_active, remark
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
             RETURNING activity_period_id
             "#,
-        ).bind(project_id).bind(body.period.trim()).bind(trimmed_optional(body.period_code.clone()))
-        .bind(&account_id).bind(body.task_month).bind(body.bitable_url.trim())
-        .bind(trimmed_optional(body.cpm_table_id.clone())).bind(body.need_trace)
-        .bind(body.workflows.morning_workflow_enabled).bind(body.workflows.periodic_sync_enabled)
-        .bind(body.workflows.periodic_sync_interval_hours).bind(body.tracking_start_date)
-        .bind(body.tracking_end_date).bind(body.is_active).bind(trimmed_optional(body.remark.clone()))
-        .fetch_one(&mut *tx).await?
+        )
+        .bind(project_id)
+        .bind(body.period.trim())
+        .bind(trimmed_optional(body.period_code.clone()))
+        .bind(&account_id)
+        .bind(body.task_month)
+        .bind(body.bitable_url.trim())
+        .bind(trimmed_optional(body.cpm_table_id.clone()))
+        .bind(body.need_trace)
+        .bind(body.workflows.morning_workflow_enabled)
+        .bind(body.workflows.periodic_sync_enabled)
+        .bind(body.tracking_start_date)
+        .bind(body.tracking_end_date)
+        .bind(body.is_active)
+        .bind(trimmed_optional(body.remark.clone()))
+        .fetch_one(&mut *tx)
+        .await?
     };
     state
         .workflow
@@ -2417,7 +2424,6 @@ fn activity_columns_sql() -> &'static str {
         period.need_trace,
         period.morning_review_enabled,
         period.periodic_sync_enabled,
-        period.periodic_sync_interval_hours,
         period.tracking_start_date,
         period.tracking_end_date,
         period.is_active,
@@ -2456,7 +2462,6 @@ fn activity_from_row(row: PgRow) -> Result<ActivityAdminDto, sqlx::Error> {
         need_trace: row.try_get("need_trace")?,
         morning_review_enabled: row.try_get("morning_review_enabled")?,
         periodic_sync_enabled: row.try_get("periodic_sync_enabled")?,
-        periodic_sync_interval_hours: row.try_get("periodic_sync_interval_hours")?,
         tracking_start_date: row.try_get("tracking_start_date")?,
         tracking_end_date: row.try_get("tracking_end_date")?,
         is_active: row.try_get("is_active")?,
@@ -2571,11 +2576,6 @@ fn validate_project_period_request(body: &UpsertProjectPeriodRequest) -> Result<
     if url.scheme() != "https" || url.host_str().is_none() {
         return Err(ApiError::bad_request(
             "bitable_url 必须是带域名的 HTTPS URL",
-        ));
-    }
-    if body.workflows.periodic_sync_interval_hours <= 0 {
-        return Err(ApiError::bad_request(
-            "periodic_sync_interval_hours 必须大于 0",
         ));
     }
     if body

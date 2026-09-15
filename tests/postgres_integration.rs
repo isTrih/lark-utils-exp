@@ -224,8 +224,8 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     let live_content_config_id: i64 = sqlx::query_scalar(
         r#"
         INSERT INTO xingtu_activity_content_config (
-            activity_period_id, content_type, xingtu_task_id, main_table_id
-        ) VALUES ($1, 'live', $2, 'integration-live-main')
+            activity_period_id, content_type, xingtu_task_id, main_table_id, audit_table_id
+        ) VALUES ($1, 'live', $2, 'integration-live-main', 'integration-live-audit')
         RETURNING content_config_id
         "#,
     )
@@ -233,13 +233,6 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     .bind(format!("{fixture}-live"))
     .fetch_one(&pool)
     .await?;
-    let optional_audit_table: Option<String> = sqlx::query_scalar(
-        "SELECT audit_table_id FROM xingtu_activity_content_config WHERE content_config_id = $1",
-    )
-    .bind(live_content_config_id)
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(optional_audit_table, None);
     let baseline_source_id: i64 = sqlx::query_scalar(
         r#"
         INSERT INTO xingtu_feishu_source (
@@ -503,6 +496,34 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     assert!(legacy_video_extra.0["key"].is_object());
 
     migrations.run(&pool).await?;
+
+    sqlx::query(
+        "UPDATE xingtu_activity_content_config SET audit_table_id = NULL WHERE content_config_id = $1",
+    )
+    .bind(live_content_config_id)
+    .execute(&pool)
+    .await?;
+    let optional_audit_table: Option<String> = sqlx::query_scalar(
+        "SELECT audit_table_id FROM xingtu_activity_content_config WHERE content_config_id = $1",
+    )
+    .bind(live_content_config_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(optional_audit_table, None);
+    let removed_interval_column_exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'xingtu_activity_period'
+              AND column_name = 'periodic_sync_interval_hours'
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(!removed_interval_column_exists);
 
     let normalized_video_extra: Json<serde_json::Value> = sqlx::query_scalar(
         "SELECT audit_extra FROM video_content WHERE content_config_id = $1 AND video_id = 'video-e'",

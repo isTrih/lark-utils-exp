@@ -34,10 +34,10 @@
 ## 工作流与时间
 
 - 所有业务日期和内置调度按 `Asia/Shanghai` 计算，不依赖容器系统默认时区。
-- `periodic` 固定在北京时间 `03:00`、`15:00`、`21:00`；`morning` 在 `09:00`；`night` 在 `23:59`。
+- `periodic` 固定在北京时间 `12:00`、`18:00`；`morning` 在 `09:00`；`night` 在 `23:59`。不再提供按小时固定间隔配置。
 - 自动工作流只检索启用且处于追踪窗口内的活动。项目之间按 `WORKFLOW_PROJECT_CONCURRENCY` 受控并行（默认 3，范围 1-16），单个项目内部步骤保持串行；一个项目失败不得阻断其他项目，全部完成后汇总为成功、部分失败或全部失败。
 - 工作流接口尽量支持可选 `activity_period_id`，用于只执行指定项目。
-- `tracking_end_date=YYYY-MM-DD` 时，北京时间 T+1 的 `03:00` 仍执行最后一次更新；T+1 `09:00` 及之后不再拉取。
+- `tracking_end_date=YYYY-MM-DD` 时，北京时间结束日 `23:59` 执行最后一次更新，次日不再拉取。
 - 星图导出长任务之间保留 `0..15` 秒随机间隔，避免集中请求。
 - `night` 会从审核表同步审核结果到数据库。
 - 每个期次允许只配置直播或只配置视频；关闭 `morning_workflow_enabled`/`morning_review_enabled` 只关闭审核通知，不得停止该期次的数据同步；API 同时接受 `audit_notice_enabled` 输入别名。
@@ -68,4 +68,5 @@
 - CORS 由 `CORS_DOMAIN` 配置；主域与 `*.子域` 必须分别声明，只接受 `http/https` Origin，未配置时禁用跨域响应，禁止全开放 `*`。
 - 服务和飞书数据同步插件都使用根路径，不再支持或恢复 `/auto` 反向代理前缀。
 - 持久化日志目录由 `LOG_DIR` 控制；Docker 默认 `/app/logs`，生产环境必须挂载持久卷。
+- 控制台与 JSONL 持久化日志时间戳统一使用北京时间，并显式包含 `+08:00` 时区偏移。
 - `RUST_LOG=debug` 会显示 OpenLark、Hyper 和 HTTP/2 的底层 DEBUG 日志；`GoAway(NO_ERROR)` 是正常连接关闭，不应当作业务错误。

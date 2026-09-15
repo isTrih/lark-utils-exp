@@ -1,10 +1,33 @@
+use chrono::Utc;
+use chrono_tz::Asia::Shanghai;
 use lark_exp::server::{build_app_state, build_router};
 use salvo::prelude::*;
 use salvo::server::ServerHandle;
+use std::fmt;
 use std::time::Duration;
 use std::{env, fs};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    EnvFilter,
+    fmt::{format::Writer, time::FormatTime},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
+
+#[derive(Clone, Copy)]
+struct BeijingTime;
+
+impl FormatTime for BeijingTime {
+    fn format_time(&self, writer: &mut Writer<'_>) -> fmt::Result {
+        writer.write_str(&format_beijing_timestamp(Utc::now()))
+    }
+}
+
+fn format_beijing_timestamp(now: chrono::DateTime<Utc>) -> String {
+    now.with_timezone(&Shanghai)
+        .format("%Y-%m-%dT%H:%M:%S%.6f%:z")
+        .to_string()
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -50,7 +73,7 @@ async fn run_server() -> anyhow::Result<()> {
 
 fn init_logging() -> anyhow::Result<Option<WorkerGuard>> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let console_layer = tracing_subscriber::fmt::layer();
+    let console_layer = tracing_subscriber::fmt::layer().with_timer(BeijingTime);
     let log_dir = env::var("LOG_DIR")
         .ok()
         .map(|value| value.trim().to_string())
@@ -65,6 +88,7 @@ fn init_logging() -> anyhow::Result<Option<WorkerGuard>> {
             Some(
                 tracing_subscriber::fmt::layer()
                     .json()
+                    .with_timer(BeijingTime)
                     .with_ansi(false)
                     .with_writer(writer),
             ),
@@ -93,5 +117,20 @@ async fn listen_shutdown_signal(handle: ServerHandle) {
     if tokio::signal::ctrl_c().await.is_ok() {
         tracing::info!("收到退出信号，开始优雅关闭");
         handle.stop_graceful(Some(Duration::from_secs(30)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn log_timestamp_uses_explicit_beijing_offset() {
+        let utc = Utc.with_ymd_and_hms(2026, 9, 15, 4, 0, 0).single().unwrap();
+        assert_eq!(
+            format_beijing_timestamp(utc),
+            "2026-09-15T12:00:00.000000+08:00"
+        );
     }
 }

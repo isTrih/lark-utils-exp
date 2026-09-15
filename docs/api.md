@@ -953,17 +953,14 @@ curl "https://api.example.com/api/v1/queries/periods"
     "need_trace": true,
     "morning_review_enabled": true,
     "periodic_sync_enabled": true,
-    "periodic_sync_interval_hours": 2,
     "tracking_start_date": "2026-07-01",
     "tracking_end_date": "2026-08-15"
   }
 ]
 ```
 
-`tracking_end_date` 表示业务追踪的最后日期，并额外包含北京时间 T+1 的 `03:00-03:59`
-最终处理窗口。例如配置为 `2026-08-03`，最后一次更新发生在
-`2026-08-04 03:00` 调度；当天 `09:00`、`15:00`、`21:00` 不再拉取星图，也不会再读取
-旧 Sheet、更新业务多维表或发送自动审核通知。
+`tracking_end_date` 表示业务追踪的最后日期。最后一次自动更新发生在结束日北京时间
+`23:59`，次日起不再拉取星图，也不会再读取旧 Sheet、更新业务多维表或发送自动审核通知。
 
 ### `GET /api/v1/queries/contents`
 
@@ -1120,7 +1117,7 @@ curl "https://api.example.com/api/v1/queries/video-metrics?limit=50&offset=0"
 
 ### `GET /api/v1/queries/video-trace-metrics`
 
-查询视频每次星图追踪导入的快照指标。这个接口读取历史导入表，适合查看 03:00、09:00、15:00、21:00、23:59 固定拉取和手动触发留下的快照数据。
+查询视频每次星图追踪导入的快照指标。这个接口读取历史导入表，适合查看 09:00、12:00、18:00、23:59 固定拉取和手动触发留下的快照数据。
 
 查询参数：支持 `content_config_id`、`video_id`、`author_uid`、`author_name`、`label`、`date`、`date_from`、`date_to`、`limit`、`offset`。
 

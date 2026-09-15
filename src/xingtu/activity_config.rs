@@ -5,7 +5,7 @@ use crate::pipeline::activity::{
 };
 use crate::xingtu::data_import::{PersistMergedRecordsOptions, XingtuDataImportRepository};
 use anyhow::{Context, anyhow};
-use chrono::{DateTime, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Asia::Shanghai;
 use salvo::oapi::ToSchema;
 use serde::{Deserialize, Serialize};
@@ -59,8 +59,6 @@ pub struct WorkflowConfig {
     pub morning_workflow_enabled: bool,
     #[serde(default = "default_true")]
     pub periodic_sync_enabled: bool,
-    #[serde(default = "default_periodic_sync_interval_hours")]
-    pub periodic_sync_interval_hours: i32,
 }
 
 impl Default for WorkflowConfig {
@@ -68,7 +66,6 @@ impl Default for WorkflowConfig {
         Self {
             morning_workflow_enabled: true,
             periodic_sync_enabled: true,
-            periodic_sync_interval_hours: default_periodic_sync_interval_hours(),
         }
     }
 }
@@ -1010,7 +1007,6 @@ impl XingtuActivityConfigRepository {
                 need_trace,
                 morning_review_enabled,
                 periodic_sync_enabled,
-                periodic_sync_interval_hours,
                 tracking_start_date,
                 tracking_end_date
             )
@@ -1026,8 +1022,7 @@ impl XingtuActivityConfigRepository {
                 $9,
                 $10,
                 $11,
-                $12,
-                $13
+                $12
             )
             ON CONFLICT (project_id, period)
             DO UPDATE SET
@@ -1039,7 +1034,6 @@ impl XingtuActivityConfigRepository {
                 need_trace = EXCLUDED.need_trace,
                 morning_review_enabled = EXCLUDED.morning_review_enabled,
                 periodic_sync_enabled = EXCLUDED.periodic_sync_enabled,
-                periodic_sync_interval_hours = EXCLUDED.periodic_sync_interval_hours,
                 tracking_start_date = EXCLUDED.tracking_start_date,
                 tracking_end_date = EXCLUDED.tracking_end_date
             RETURNING activity_period_id
@@ -1055,7 +1049,6 @@ impl XingtuActivityConfigRepository {
         .bind(config.need_trace)
         .bind(config.workflows.morning_workflow_enabled)
         .bind(config.workflows.periodic_sync_enabled)
-        .bind(config.workflows.periodic_sync_interval_hours)
         .bind(config.tracking_start_date)
         .bind(config.tracking_end_date)
         .fetch_one(&mut **tx)
@@ -1318,10 +1311,6 @@ pub fn validate_activity_config(config: &ActivityConfig) -> anyhow::Result<()> {
         return Err(anyhow!("cpm_table_id 不能是空字符串"));
     }
 
-    if config.workflows.periodic_sync_interval_hours <= 0 {
-        return Err(anyhow!("periodic_sync_interval_hours 必须大于 0"));
-    }
-
     validate_activity_contents(&config.contents)?;
 
     Ok(())
@@ -1452,10 +1441,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_periodic_sync_interval_hours() -> i32 {
-    2
-}
-
 fn default_spreadsheet_url_update_mode() -> String {
     "xingtu_export".to_string()
 }
@@ -1478,8 +1463,7 @@ fn default_manual_auto_approve_result() -> String {
 
 /// 判断一次星图拉取是否落在活动追踪窗口内。
 ///
-/// `tracking_end_date` 当天结束后，额外保留北京时间 T+1 的 03:00 小时，
-/// 供 03:00 定时任务完成最后一次更新；09:00 及后续时段不再拉取。
+/// `tracking_end_date` 当天 23:59 是最后一次自动更新窗口，次日不再拉取。
 fn tracking_window_includes(
     run_at: DateTime<Utc>,
     tracking_start_date: Option<NaiveDate>,
@@ -1495,11 +1479,7 @@ fn tracking_window_includes(
     let Some(end_date) = tracking_end_date else {
         return true;
     };
-    if local_date <= end_date {
-        return true;
-    }
-
-    end_date.succ_opt() == Some(local_date) && local.hour() == 3
+    local_date <= end_date
 }
 
 /// 当前时间，测试时可通过单独函数替换调用点。
@@ -1521,7 +1501,7 @@ mod tests {
     }
 
     #[test]
-    fn tracking_end_date_includes_only_next_day_three_oclock_window() {
+    fn tracking_end_date_stops_after_the_final_day() {
         let end_date = NaiveDate::from_ymd_opt(2026, 8, 3).expect("valid date");
 
         assert!(tracking_window_includes(
@@ -1529,12 +1509,12 @@ mod tests {
             None,
             Some(end_date),
         ));
-        assert!(tracking_window_includes(
+        assert!(!tracking_window_includes(
             beijing_time(2026, 8, 4, 3, 0),
             None,
             Some(end_date),
         ));
-        assert!(tracking_window_includes(
+        assert!(!tracking_window_includes(
             beijing_time(2026, 8, 4, 3, 59),
             None,
             Some(end_date),
@@ -1636,6 +1616,22 @@ mod tests {
             let config: WorkflowConfig = serde_json::from_value(value).unwrap();
             assert!(!config.morning_workflow_enabled);
         }
+    }
+
+    #[test]
+    fn workflow_config_ignores_removed_interval_from_old_clients() {
+        let config: WorkflowConfig = serde_json::from_value(serde_json::json!({
+            "periodic_sync_enabled": true,
+            "periodic_sync_interval_hours": 2
+        }))
+        .unwrap();
+        assert!(config.periodic_sync_enabled);
+        assert!(
+            serde_json::to_value(config)
+                .unwrap()
+                .get("periodic_sync_interval_hours")
+                .is_none()
+        );
     }
 
     #[test]
