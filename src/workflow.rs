@@ -11,7 +11,7 @@ use crate::workflow_run::WorkflowRunRepository;
 use crate::xingtu::account::{
     XingtuAccountRepository, XingtuProjectAccount, XingtuSessionRegistry,
 };
-use crate::xingtu::activity_config::XingtuActivityConfigRepository;
+use crate::xingtu::activity_config::{WorkflowActivityScope, XingtuActivityConfigRepository};
 use crate::xingtu::data_import::{
     PendingImportResult, XingtuDataImportRepository, import_feishu_source_by_id,
     import_pending_feishu_sources_for_project,
@@ -23,6 +23,7 @@ use crate::xingtu::{ExportTaskOptions, XingtuSession};
 use anyhow::{Context, anyhow};
 use chrono::Utc;
 use chrono_tz::Asia::Shanghai;
+use futures::{StreamExt, stream};
 use salvo::oapi::ToSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -30,10 +31,14 @@ use sqlx::{Postgres, Transaction};
 use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     future::Future,
     sync::Arc,
 };
 use tokio::sync::Mutex;
+
+const DEFAULT_PROJECT_CONCURRENCY: usize = 3;
+const MAX_PROJECT_CONCURRENCY: usize = 16;
 
 #[derive(Debug)]
 pub(crate) struct WorkflowBusyError;
@@ -91,6 +96,30 @@ pub struct WorkflowRunResult {
     pub synced_activities: usize,
     pub audit_result_sync: Option<AuditResultSyncResult>,
     pub audit_notice_sent: bool,
+    /// 单个项目失败不会阻止其他项目；失败详情在这里汇总。
+    pub failed_activities: Vec<WorkflowActivityFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct WorkflowActivityFailure {
+    pub project_id: i64,
+    pub activity_period_id: i64,
+    pub xingtu_account_id: String,
+    pub error: String,
+}
+
+struct ActivityWorkflowResult {
+    activity_period_id: i64,
+    trace: TraceRoundResult,
+    pending_import: PendingImportResult,
+    synced_activities: usize,
+    audit_result_sync: Option<AuditResultSyncResult>,
+    audit_notice_sent: bool,
+}
+
+struct WorkflowBatchOutcome {
+    result: WorkflowRunResult,
+    errors: Vec<anyhow::Error>,
 }
 
 /// 单次手动登记专项同步结果。
@@ -214,18 +243,57 @@ impl XingtuWorkflowService {
                 request_id,
             )
             .await?;
-        let result = self
+        let outcome = self
             .run_workflow_inner(run_id, kind, activity_period_id)
             .await;
-
-        self.finish_serializable_run(run_id, &result).await?;
+        match &outcome {
+            Ok(outcome) if outcome.result.failed_activities.is_empty() => {
+                self.workflow_run_repo
+                    .finish_run_success(run_id, json!({ "result": &outcome.result }))
+                    .await?;
+            }
+            Ok(outcome) => {
+                let error_summary = outcome
+                    .result
+                    .failed_activities
+                    .iter()
+                    .map(|failure| {
+                        format!(
+                            "project_id={} activity_period_id={}: {}",
+                            failure.project_id, failure.activity_period_id, failure.error
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("；");
+                let summary = json!({ "result": &outcome.result });
+                if outcome.result.processed_activity_period_ids.is_empty() {
+                    self.workflow_run_repo
+                        .finish_run_all_projects_failed(run_id, summary, &error_summary)
+                        .await?;
+                } else {
+                    self.workflow_run_repo
+                        .finish_run_partial_failure(run_id, summary, &error_summary)
+                        .await?;
+                }
+            }
+            Err(error) => {
+                self.workflow_run_repo
+                    .finish_run_failure(run_id, "failed", "operation_failed", &format!("{error:#}"))
+                    .await?;
+            }
+        }
         lock_tx.commit().await.context("释放跨实例工作流锁失败")?;
 
-        if let Err(error) = &result {
-            self.send_workflow_error_notices(kind, error).await;
+        match &outcome {
+            Ok(outcome) => {
+                for error in &outcome.errors {
+                    self.send_workflow_error_notices(kind, error).await;
+                }
+            }
+            Err(error) => self.send_workflow_error_notices(kind, error).await,
         }
 
-        result
+        outcome.map(|outcome| outcome.result)
     }
 
     async fn run_workflow_inner(
@@ -233,177 +301,206 @@ impl XingtuWorkflowService {
         workflow_run_id: i64,
         kind: WorkflowKind,
         activity_period_id: Option<i64>,
-    ) -> anyhow::Result<WorkflowRunResult> {
+    ) -> anyhow::Result<WorkflowBatchOutcome> {
         let pull_started_at = Utc::now();
         let activity_scopes = self
             .activity_repo
             .list_workflow_activity_scopes(pull_started_at, activity_period_id)
             .await
             .context("读取当前自动工作流活动失败")?;
+        let project_concurrency = workflow_project_concurrency();
         tracing::info!(
             workflow = kind.trigger_type(),
             requested_activity_period_id = ?activity_period_id,
             activity_scopes = ?activity_scopes,
-            "自动工作流已确定项目执行顺序"
+            project_concurrency,
+            "自动工作流已确定并行项目范围"
         );
-        let mut trace = TraceRoundResult::default();
-        let mut pending_import = PendingImportResult::default();
-        let mut synced_activities = 0;
-        let mut audit_result_sync = kind.is_daily_final().then(AuditResultSyncResult::default);
-        let mut audit_notice_sent = false;
-        let mut processed_activity_period_ids = Vec::new();
+        let mut outcomes = stream::iter(activity_scopes.into_iter().enumerate())
+            .map(|(index, activity_scope)| {
+                let service = self.clone();
+                async move {
+                    let result = service
+                        .run_activity_workflow(
+                            workflow_run_id,
+                            kind,
+                            activity_scope.clone(),
+                            pull_started_at,
+                            index > 0,
+                        )
+                        .await;
+                    (activity_scope, result)
+                }
+            })
+            .buffer_unordered(project_concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        outcomes.sort_by_key(|(scope, _)| scope.activity_period_id);
+        Ok(aggregate_activity_outcomes(workflow_run_id, kind, outcomes))
+    }
 
-        for activity_scope in activity_scopes {
-            let project_id = activity_scope.project_id;
-            let activity_period_id = activity_scope.activity_period_id;
-            let xingtu_account_id = activity_scope.xingtu_account_id;
-            let project_lark = self
-                .project_lark
-                .client_for_project(project_id)
+    async fn run_activity_workflow(
+        &self,
+        workflow_run_id: i64,
+        kind: WorkflowKind,
+        activity_scope: WorkflowActivityScope,
+        pull_started_at: chrono::DateTime<Utc>,
+        jitter_before_first_export: bool,
+    ) -> anyhow::Result<ActivityWorkflowResult> {
+        let project_id = activity_scope.project_id;
+        let activity_period_id = activity_scope.activity_period_id;
+        let xingtu_account_id = activity_scope.xingtu_account_id;
+        let audit_notice_enabled = activity_scope.audit_notice_enabled;
+        let project_lark = self
+            .project_lark
+            .client_for_project(project_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 初始化项目 {project_id} 的飞书客户端失败"
+                )
+            })?;
+        tracing::info!(
+            workflow = kind.trigger_type(),
+            project_id,
+            activity_period_id,
+            xingtu_account_id,
+            "开始执行项目完整工作流"
+        );
+
+        let trace = self
+            .tracked_step(workflow_run_id, activity_period_id, "xingtu_export", async {
+                run_xingtu_trace_once_with_registry(
+                    &self.activity_repo,
+                    &self.session_registry,
+                    XingtuTraceRunOptions {
+                        export_options: ExportTaskOptions::default(),
+                        activity_period_id: Some(activity_period_id),
+                        jitter_before_first_export,
+                        trigger_type: kind.trigger_type().to_string(),
+                        is_daily_final: kind.is_daily_final(),
+                        pull_started_at,
+                        created_by: format!("workflow:{}", kind.trigger_type()),
+                    },
+                )
                 .await
-                .with_context(|| format!("初始化项目 {project_id} 的飞书客户端失败"))?;
+                .with_context(|| {
+                    format!(
+                        "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 拉取星图源数据链接失败"
+                    )
+                })
+            })
+            .await?;
+
+        let pending_import = self
+            .tracked_step(workflow_run_id, activity_period_id, "pending_import", async {
+                import_pending_feishu_sources_for_project(
+                    &self.data_import_repo,
+                    &project_lark,
+                    200,
+                    Some(activity_period_id),
+                    project_id,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 导入 pending 来源失败"
+                    )
+                })
+            })
+            .await?;
+
+        let synced_activities = self
+            .tracked_step(workflow_run_id, activity_period_id, "table_sync", async {
+                let activity_configs = self
+                    .activity_repo
+                    .list_sync_activity_configs(
+                        self.data_import_repo.clone(),
+                        pull_started_at,
+                        Some(activity_period_id),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 读取同步配置失败"
+                        )
+                    })?;
+                let count = activity_configs.len();
+                run_activity_sync_workflow_with_client(project_lark.clone(), activity_configs)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 同步数据到飞书多维表失败"
+                        )
+                    })?;
+                Ok(count)
+            })
+            .await?;
+
+        let audit_result_sync = if kind.is_daily_final() {
             tracing::info!(
                 workflow = kind.trigger_type(),
+                activity_period_id,
+                "开始从审核表同步审核结果"
+            );
+            Some(
+                self.tracked_step(
+                    workflow_run_id,
+                    activity_period_id,
+                    "audit_result_sync",
+                    async {
+                        self.sync_audit_results_from_db(Some(activity_period_id))
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 从审核表同步结果失败"
+                                )
+                            })
+                    },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        let audit_notice_sent = if kind.should_notify_audit() && audit_notice_enabled {
+            self.tracked_step(
+                workflow_run_id,
+                activity_period_id,
+                "audit_notice",
+                async {
+                    self.run_audit_notice_from_db(Some(activity_period_id), true)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 发送审核通知失败"
+                            )
+                        })
+                },
+            )
+            .await?
+            .audit_notice_sent
+        } else if kind.should_notify_audit() {
+            tracing::info!(
                 project_id,
                 activity_period_id,
-                xingtu_account_id,
-                "开始执行项目完整工作流"
+                "该期次已关闭审核通知，跳过通知步骤"
             );
+            false
+        } else {
+            false
+        };
 
-            let activity_trace = self
-                .tracked_step(workflow_run_id, activity_period_id, "xingtu_export", async {
-                    run_xingtu_trace_once_with_registry(
-                        &self.activity_repo,
-                        &self.session_registry,
-                        XingtuTraceRunOptions {
-                            export_options: ExportTaskOptions::default(),
-                            activity_period_id: Some(activity_period_id),
-                            jitter_before_first_export: trace.traced_count > 0,
-                            trigger_type: kind.trigger_type().to_string(),
-                            is_daily_final: kind.is_daily_final(),
-                            pull_started_at,
-                            created_by: format!("workflow:{}", kind.trigger_type()),
-                        },
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 拉取星图源数据链接失败"
-                        )
-                    })
-                })
-                .await?;
-            trace.traced_count += activity_trace.traced_count;
-            trace.skipped_count += activity_trace.skipped_count;
-            trace.results.extend(activity_trace.results);
-
-            let activity_import = self
-                .tracked_step(workflow_run_id, activity_period_id, "pending_import", async {
-                    import_pending_feishu_sources_for_project(
-                        &self.data_import_repo,
-                        &project_lark,
-                        200,
-                        Some(activity_period_id),
-                        project_id,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 导入 pending 来源失败"
-                        )
-                    })
-                })
-                .await?;
-            merge_pending_import_result(&mut pending_import, activity_import);
-
-            synced_activities += self
-                .tracked_step(workflow_run_id, activity_period_id, "table_sync", async {
-                    let activity_configs = self
-                        .activity_repo
-                        .list_sync_activity_configs(
-                            self.data_import_repo.clone(),
-                            pull_started_at,
-                            Some(activity_period_id),
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 读取同步配置失败"
-                            )
-                        })?;
-                    let count = activity_configs.len();
-                    run_activity_sync_workflow_with_client(project_lark.clone(), activity_configs)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 同步数据到飞书多维表失败"
-                            )
-                        })?;
-                    Ok(count)
-                })
-                .await?;
-
-            if let Some(total) = audit_result_sync.as_mut() {
-                tracing::info!(
-                    workflow = kind.trigger_type(),
-                    activity_period_id,
-                    "开始从审核表同步审核结果"
-                );
-                let result = self
-                    .tracked_step(
-                        workflow_run_id,
-                        activity_period_id,
-                        "audit_result_sync",
-                        async {
-                            self.sync_audit_results_from_db(Some(activity_period_id))
-                                .await
-                                .with_context(|| {
-                                    format!(
-                                        "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 从审核表同步结果失败"
-                                    )
-                                })
-                        },
-                    )
-                    .await?;
-                total.tables_processed += result.tables_processed;
-                total.records_read += result.records_read;
-                total.reviewed_records += result.reviewed_records;
-                total.database_rows_updated += result.database_rows_updated;
-            }
-
-            if kind.should_notify_audit() {
-                audit_notice_sent |= self
-                    .tracked_step(
-                        workflow_run_id,
-                        activity_period_id,
-                        "audit_notice",
-                        async {
-                            self.run_audit_notice_from_db(Some(activity_period_id), true)
-                                .await
-                                .with_context(|| {
-                                    format!(
-                                        "活动期次 `{activity_period_id}` account_id={xingtu_account_id} 发送审核通知失败"
-                                    )
-                                })
-                        },
-                    )
-                    .await?
-                    .audit_notice_sent;
-            }
-
-            processed_activity_period_ids.push(activity_period_id);
-            tracing::info!(
-                workflow = kind.trigger_type(),
-                activity_period_id,
-                xingtu_account_id,
-                "项目完整工作流执行完成"
-            );
-        }
-
-        Ok(WorkflowRunResult {
-            workflow_run_id,
-            workflow_kind: kind,
-            processed_activity_period_ids,
+        tracing::info!(
+            workflow = kind.trigger_type(),
+            project_id,
+            activity_period_id,
+            xingtu_account_id,
+            "项目完整工作流执行完成"
+        );
+        Ok(ActivityWorkflowResult {
+            activity_period_id,
             trace,
             pending_import,
             synced_activities,
@@ -1117,6 +1214,101 @@ fn audit_notice_summary(
     format!("{project_name} 审核通知：{periods}")
 }
 
+fn workflow_project_concurrency() -> usize {
+    let Some(value) = env::var("WORKFLOW_PROJECT_CONCURRENCY")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return DEFAULT_PROJECT_CONCURRENCY;
+    };
+    match value.parse::<usize>() {
+        Ok(value @ 1..=MAX_PROJECT_CONCURRENCY) => value,
+        _ => {
+            tracing::warn!(
+                value,
+                default = DEFAULT_PROJECT_CONCURRENCY,
+                "WORKFLOW_PROJECT_CONCURRENCY 无效，使用默认值"
+            );
+            DEFAULT_PROJECT_CONCURRENCY
+        }
+    }
+}
+
+fn bounded_workflow_error(error: &anyhow::Error) -> String {
+    const MAX_CHARS: usize = 4_000;
+    format!("{error:#}").chars().take(MAX_CHARS).collect()
+}
+
+fn aggregate_activity_outcomes(
+    workflow_run_id: i64,
+    kind: WorkflowKind,
+    outcomes: Vec<(
+        WorkflowActivityScope,
+        anyhow::Result<ActivityWorkflowResult>,
+    )>,
+) -> WorkflowBatchOutcome {
+    let mut trace = TraceRoundResult::default();
+    let mut pending_import = PendingImportResult::default();
+    let mut synced_activities = 0;
+    let mut audit_result_sync = kind.is_daily_final().then(AuditResultSyncResult::default);
+    let mut audit_notice_sent = false;
+    let mut processed_activity_period_ids = Vec::new();
+    let mut failed_activities = Vec::new();
+    let mut errors = Vec::new();
+
+    for (scope, result) in outcomes {
+        match result {
+            Ok(activity) => {
+                processed_activity_period_ids.push(activity.activity_period_id);
+                trace.traced_count += activity.trace.traced_count;
+                trace.skipped_count += activity.trace.skipped_count;
+                trace.results.extend(activity.trace.results);
+                merge_pending_import_result(&mut pending_import, activity.pending_import);
+                synced_activities += activity.synced_activities;
+                audit_notice_sent |= activity.audit_notice_sent;
+                if let (Some(total), Some(current)) =
+                    (audit_result_sync.as_mut(), activity.audit_result_sync)
+                {
+                    merge_audit_result_sync_result(total, current);
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    workflow = kind.trigger_type(),
+                    project_id = scope.project_id,
+                    activity_period_id = scope.activity_period_id,
+                    xingtu_account_id = %scope.xingtu_account_id,
+                    error = ?error,
+                    "单个项目工作流失败，其他项目不受影响"
+                );
+                failed_activities.push(WorkflowActivityFailure {
+                    project_id: scope.project_id,
+                    activity_period_id: scope.activity_period_id,
+                    xingtu_account_id: scope.xingtu_account_id,
+                    error: bounded_workflow_error(&error),
+                });
+                errors.push(error);
+            }
+        }
+    }
+
+    WorkflowBatchOutcome {
+        result: WorkflowRunResult {
+            workflow_run_id,
+            workflow_kind: kind,
+            processed_activity_period_ids,
+            trace,
+            pending_import,
+            synced_activities,
+            audit_result_sync,
+            audit_notice_sent,
+            failed_activities,
+        },
+        errors,
+    }
+}
+
 fn merge_pending_import_result(total: &mut PendingImportResult, current: PendingImportResult) {
     total.discovered_sources += current.discovered_sources;
     total.imported_sources += current.imported_sources;
@@ -1126,6 +1318,16 @@ fn merge_pending_import_result(total: &mut PendingImportResult, current: Pending
     total.persisted_rows += current.persisted_rows;
     total.quarantined_rows += current.quarantined_rows;
     total.failures.extend(current.failures);
+}
+
+fn merge_audit_result_sync_result(
+    total: &mut AuditResultSyncResult,
+    current: AuditResultSyncResult,
+) {
+    total.tables_processed += current.tables_processed;
+    total.records_read += current.records_read;
+    total.reviewed_records += current.reviewed_records;
+    total.database_rows_updated += current.database_rows_updated;
 }
 
 fn select_workflow_error_notice_accounts<'a>(
@@ -1240,6 +1442,49 @@ pub fn parse_workflow_kind(value: &str) -> anyhow::Result<WorkflowKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn workflow_scope(project_id: i64, activity_period_id: i64) -> WorkflowActivityScope {
+        WorkflowActivityScope {
+            project_id,
+            activity_period_id,
+            xingtu_account_id: format!("account-{project_id}"),
+            audit_notice_enabled: true,
+        }
+    }
+
+    #[test]
+    fn one_project_failure_keeps_other_project_result() {
+        let outcome = aggregate_activity_outcomes(
+            100,
+            WorkflowKind::Periodic,
+            vec![
+                (workflow_scope(1, 10), Err(anyhow!("project one failed"))),
+                (
+                    workflow_scope(2, 11),
+                    Ok(ActivityWorkflowResult {
+                        activity_period_id: 11,
+                        trace: TraceRoundResult::default(),
+                        pending_import: PendingImportResult::default(),
+                        synced_activities: 2,
+                        audit_result_sync: None,
+                        audit_notice_sent: false,
+                    }),
+                ),
+            ],
+        );
+
+        assert_eq!(outcome.result.processed_activity_period_ids, vec![11]);
+        assert_eq!(outcome.result.synced_activities, 2);
+        assert_eq!(outcome.result.failed_activities.len(), 1);
+        assert_eq!(outcome.result.failed_activities[0].activity_period_id, 10);
+        assert_eq!(outcome.errors.len(), 1);
+    }
+
+    #[test]
+    fn workflow_error_detail_is_bounded() {
+        let error = anyhow!("{}", "x".repeat(5_000));
+        assert_eq!(bounded_workflow_error(&error).chars().count(), 4_000);
+    }
 
     fn workflow_account(
         xingtu_account_id: &str,

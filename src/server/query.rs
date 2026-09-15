@@ -129,7 +129,7 @@ pub struct ContentConfigDto {
     pub source_spreadsheet_url: Option<String>,
     pub manual_table_id: Option<String>,
     pub main_table_id: String,
-    pub audit_table_id: String,
+    pub audit_table_id: Option<String>,
     pub sync_enabled: bool,
     pub trace_enabled: bool,
 }

@@ -54,8 +54,25 @@ async fn run_daily_workflow_loop(state: Arc<AppState>, kind: WorkflowKind, time:
         if let Err(error) = state.query_cache.invalidate_all_shared().await {
             tracing::error!(error = ?error, "跨实例失效查询缓存失败");
         }
-        if let Err(error) = result {
-            tracing::error!("定时工作流执行失败：kind={kind:?} error={error:?}");
+        match result {
+            Ok(result) if result.failed_activities.is_empty() => {
+                tracing::info!(
+                    kind = ?kind,
+                    processed_activity_period_ids = ?result.processed_activity_period_ids,
+                    "定时工作流全部项目执行成功"
+                );
+            }
+            Ok(result) => {
+                tracing::error!(
+                    kind = ?kind,
+                    processed_activity_period_ids = ?result.processed_activity_period_ids,
+                    failed_activities = ?result.failed_activities,
+                    "定时工作流存在项目执行失败"
+                );
+            }
+            Err(error) => {
+                tracing::error!("定时工作流执行失败：kind={kind:?} error={error:?}");
+            }
         }
     }
 }

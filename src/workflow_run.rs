@@ -101,6 +101,40 @@ impl WorkflowRunRepository {
         Ok(())
     }
 
+    pub async fn finish_run_partial_failure(
+        &self,
+        run_id: i64,
+        summary: Value,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE workflow_run SET status = 'partial_failed', finished_at = now(), summary = $2, error_code = 'project_partial_failure', error_message = $3 WHERE workflow_run_id = $1",
+        )
+        .bind(run_id)
+        .bind(summary)
+        .bind(truncate_error(error))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn finish_run_all_projects_failed(
+        &self,
+        run_id: i64,
+        summary: Value,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE workflow_run SET status = 'failed', finished_at = now(), summary = $2, error_code = 'all_projects_failed', error_message = $3 WHERE workflow_run_id = $1",
+        )
+        .bind(run_id)
+        .bind(summary)
+        .bind(truncate_error(error))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn finish_run_failure(
         &self,
         run_id: i64,

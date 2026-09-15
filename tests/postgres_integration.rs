@@ -224,8 +224,8 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     let live_content_config_id: i64 = sqlx::query_scalar(
         r#"
         INSERT INTO xingtu_activity_content_config (
-            activity_period_id, content_type, xingtu_task_id, main_table_id, audit_table_id
-        ) VALUES ($1, 'live', $2, 'integration-live-main', 'integration-live-audit')
+            activity_period_id, content_type, xingtu_task_id, main_table_id
+        ) VALUES ($1, 'live', $2, 'integration-live-main')
         RETURNING content_config_id
         "#,
     )
@@ -233,6 +233,13 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     .bind(format!("{fixture}-live"))
     .fetch_one(&pool)
     .await?;
+    let optional_audit_table: Option<String> = sqlx::query_scalar(
+        "SELECT audit_table_id FROM xingtu_activity_content_config WHERE content_config_id = $1",
+    )
+    .bind(live_content_config_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(optional_audit_table, None);
     let baseline_source_id: i64 = sqlx::query_scalar(
         r#"
         INSERT INTO xingtu_feishu_source (

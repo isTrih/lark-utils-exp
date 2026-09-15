@@ -307,9 +307,10 @@ curl -X POST "https://api.example.com/api/v1/xingtu/sessions/check-all"
 
 手动执行工作流。
 
-工作流先检索仍处于追踪窗口内的启用活动期次，再按 `task_month` 和
-`activity_period_id` 顺序串行执行。每个项目完整完成“星图拉取 -> pending 来源导入 ->
-数据库及飞书表同步 -> 夜间审核结果回写或早间审核通知”后，才开始下一个项目。
+工作流先检索仍处于追踪窗口内的启用活动期次，再按项目受控并行执行，并发数由
+`WORKFLOW_PROJECT_CONCURRENCY` 控制，默认 `3`，允许 `1-16`。每个项目内部仍按“星图拉取 ->
+pending 来源导入 -> 数据库及飞书表同步 -> 夜间审核结果回写或早间审核通知”的顺序执行。
+单个项目失败不会中止其他项目；全部结束后统一汇总成功期次和失败详情。
 
 路径参数：
 
@@ -377,7 +378,8 @@ curl -X POST "https://api.example.com/api/v1/workflows/morning/run" \
     },
     "synced_activities": 1,
     "audit_result_sync": null,
-    "audit_notice_sent": true
+    "audit_notice_sent": true,
+    "failed_activities": []
   }
 }
 ```
@@ -396,6 +398,11 @@ curl -X POST "https://api.example.com/api/v1/workflows/morning/run" \
 | `synced_activities` | integer | 本轮同步到多维表的活动配置数量 |
 | `audit_result_sync` | object/null | `night` 工作流的审核结果回写汇总；其他工作流为 `null` |
 | `audit_notice_sent` | boolean | 是否发送了审核通知 |
+| `failed_activities` | array | 失败项目列表，包含 `project_id`、`activity_period_id`、`xingtu_account_id` 和错误摘要；一个项目失败不影响其余项目继续执行 |
+
+工作流台账在全部项目成功时记录为 `succeeded`；部分项目成功时记录为
+`partial_failed`；所有项目均失败时记录为 `failed`。HTTP 请求完成后仍返回本轮完整汇总，调用方
+应同时检查 `failed_activities`，不能只根据 HTTP 状态判断每个项目是否成功。
 
 Night 工作流可以在同一业务日期重复执行。同一 `content_config_id + stat_date`
 已有每日最终飞书来源时，服务会复用原 `feishu_source_id`，更新为本次导出的链接，
@@ -872,10 +879,22 @@ curl -X PATCH "https://api.example.com/api/v1/admin/projects/1/periods/1/status"
   -d '{
     "is_active": true,
     "need_trace": true,
-    "morning_review_enabled": true,
+    "morning_review_enabled": false,
     "periodic_sync_enabled": true
   }'
 ```
+
+`contents` 是当前期次的完整启用内容配置，可以只传一个 `live`，也可以只传一个 `video`；
+不要求直播和视频同时存在。更新期次时，未出现在 `contents` 中的旧内容类型会被停用，并且不再参与
+星图导出、数据库/飞书表同步、夜间审核结果同步和审核通知。`contents` 至少保留一个内容类型。
+
+特殊内容类型不需要审核表时，可以省略 `tables.audit_table_id`、传 JSON `null` 或空字符串；服务会
+统一保存为数据库 `NULL`。该内容仍正常写入业务主表，但会跳过审核表写入、night 审核结果回写和
+morning 待审核数量统计。不要把字符串 `"NULL"` 当作表 ID。
+
+完整期次配置使用 `workflows.morning_workflow_enabled=false`，状态接口使用
+`morning_review_enabled=false`，表示该期次不发送 morning 审核通知，但不影响直播或视频的星图拉取
+和数据同步。两个入口也兼容更直观的输入别名 `audit_notice_enabled`。
 
 期次详情返回期次固有配置和其下直播/视频内容配置。旧 `/admin/activities*` 和全局
 `/admin/auditors*` 已移除；这是 1.0.0 的不兼容收口，不提供别名路由。
@@ -970,7 +989,7 @@ curl "https://api.example.com/api/v1/queries/contents"
     "source_spreadsheet_url": "https://example.larksuite.com/sheets/ExampleSpreadsheetToken",
     "manual_table_id": "tblExampleVideoManual",
     "main_table_id": "tblExampleVideoMain",
-    "audit_table_id": "tblExampleVideoAudit",
+    "audit_table_id": null,
     "sync_enabled": true,
     "trace_enabled": true
   }

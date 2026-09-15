@@ -13,6 +13,7 @@ base64 = "0.22.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 chrono-tz = "0.10.4"
 getrandom = "0.3.4"
+futures = "0.3.31"
 
 # 处理csv
 csv = "1.4.0"

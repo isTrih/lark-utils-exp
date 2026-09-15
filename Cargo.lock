@@ -1683,6 +1683,7 @@ dependencies = [
  "chrono-tz",
  "csv",
  "dotenvy",
+ "futures",
  "getrandom 0.3.4",
  "moka",
  "openlark",

@@ -55,6 +55,8 @@ LOG_DIR=/app/logs
 TZ=Asia/Shanghai
 LARK_BASE_URL=https://open.feishu.cn
 CORS_DOMAIN=["example.com","*.example.com"]
+# 项目间受控并行；单项目内部步骤仍按顺序执行。允许 1-16，默认 3。
+WORKFLOW_PROJECT_CONCURRENCY=3
 # 旧部署兼容项；未配置 MUTATION_API_TOKEN 时才回退使用。
 # ADMIN_API_TOKEN=replace-with-a-long-random-secret
 

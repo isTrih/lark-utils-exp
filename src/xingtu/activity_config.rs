@@ -52,7 +52,10 @@ pub struct ActivityConfig {
 /// 调度开关配置。
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct WorkflowConfig {
+    /// 是否发送 morning 审核通知；关闭后数据同步仍照常执行。
+    /// 也接受更直观的输入字段 `audit_notice_enabled`。
     #[serde(default = "default_true")]
+    #[serde(alias = "audit_notice_enabled")]
     pub morning_workflow_enabled: bool,
     #[serde(default = "default_true")]
     pub periodic_sync_enabled: bool,
@@ -135,7 +138,9 @@ pub struct TableConfig {
     pub main_table_id: String,
     #[serde(default)]
     pub manual_table_id: Option<String>,
-    pub audit_table_id: String,
+    /// 可选；不配置时只同步主表，并跳过审核相关流程。
+    #[serde(default)]
+    pub audit_table_id: Option<String>,
 }
 
 /// 同步规则配置。
@@ -200,6 +205,7 @@ pub struct WorkflowActivityScope {
     pub project_id: i64,
     pub activity_period_id: i64,
     pub xingtu_account_id: String,
+    pub audit_notice_enabled: bool,
 }
 
 /// 从数据库读取出来的一条同步内容配置。
@@ -214,7 +220,7 @@ struct SyncableContentConfig {
     source_spreadsheet_url: String,
     manual_table_id: Option<String>,
     main_table_id: String,
-    audit_table_id: String,
+    audit_table_id: Option<String>,
     data_source_field: String,
     spreadsheet_source_value: String,
     manual_source_value: String,
@@ -352,6 +358,7 @@ impl XingtuActivityConfigRepository {
                 p.project_id,
                 p.activity_period_id,
                 p.xingtu_account_id,
+                p.morning_review_enabled AS audit_notice_enabled,
                 p.tracking_start_date,
                 p.tracking_end_date
             FROM xingtu_activity_period p
@@ -382,6 +389,7 @@ impl XingtuActivityConfigRepository {
                     project_id: row.try_get("project_id")?,
                     activity_period_id: row.try_get("activity_period_id")?,
                     xingtu_account_id: row.try_get("xingtu_account_id")?,
+                    audit_notice_enabled: row.try_get("audit_notice_enabled")?,
                 });
             }
         }
@@ -488,6 +496,7 @@ impl XingtuActivityConfigRepository {
             WHERE
                 p.is_active = true
                 AND c.sync_enabled = true
+                AND c.audit_table_id IS NOT NULL
                 AND btrim(c.audit_table_id) <> ''
                 AND ($1::bigint IS NULL OR p.activity_period_id = $1)
             ORDER BY p.task_month, p.period, c.content_type
@@ -550,6 +559,7 @@ impl XingtuActivityConfigRepository {
                 AND project.is_active = true
                 AND project.notification_receive_id IS NOT NULL
                 AND c.sync_enabled = true
+                AND c.audit_table_id IS NOT NULL
                 AND btrim(c.audit_table_id) <> ''
                 AND ($1::bigint IS NULL OR p.activity_period_id = $1)
             ORDER BY project.project_key, p.task_month DESC, p.activity_period_id DESC, c.content_type
@@ -1229,7 +1239,7 @@ impl XingtuActivityConfigRepository {
             .bind(content.source.spreadsheet_url_update_mode.trim())
             .bind(manual_table_id)
             .bind(content.tables.main_table_id.trim())
-            .bind(content.tables.audit_table_id.trim())
+            .bind(trim_optional(content.tables.audit_table_id.as_deref()))
             .bind(content.sync_rule.data_source_field.trim())
             .bind(content.sync_rule.spreadsheet_source_value.trim())
             .bind(content.sync_rule.manual_source_value.trim())
@@ -1321,6 +1331,11 @@ pub fn validate_activity_contents(contents: &[ActivityContentConfig]) -> anyhow:
     if contents.is_empty() {
         return Err(anyhow!("contents 不能为空"));
     }
+    if !contents.iter().any(|content| content.sync_enabled) {
+        return Err(anyhow!(
+            "contents 至少需要一个 sync_enabled=true 的直播或视频配置；如需停止整期请停用期次"
+        ));
+    }
     let mut seen_content_type = HashSet::new();
     let mut task_ids = HashSet::new();
     for content in contents {
@@ -1359,10 +1374,6 @@ pub fn validate_activity_contents(contents: &[ActivityContentConfig]) -> anyhow:
 
         if content.tables.main_table_id.trim().is_empty() {
             return Err(anyhow!("main_table_id 不能为空"));
-        }
-
-        if content.tables.audit_table_id.trim().is_empty() {
-            return Err(anyhow!("audit_table_id 不能为空"));
         }
     }
 
@@ -1421,7 +1432,7 @@ fn build_activity_table_sync_config(
         source_mode,
         manual_table_id: content.manual_table_id,
         main_table_id: content.main_table_id,
-        audit_table_id: Some(content.audit_table_id),
+        audit_table_id: content.audit_table_id,
         sync_rule,
         db_sync: Some(ActivityTableDbSyncConfig {
             repository: data_import_repo,
@@ -1569,6 +1580,61 @@ mod tests {
                     .iter()
                     .all(|content| !content.sync_rule.manual_overrides_spreadsheet)
             );
+        }
+    }
+
+    #[test]
+    fn activity_config_accepts_live_only_or_video_only() {
+        let configs: Vec<ActivityConfig> =
+            serde_json::from_str(include_str!("../../a-config-example.json")).unwrap();
+        let content = configs[0].contents[0].clone();
+        validate_activity_contents(std::slice::from_ref(&content)).unwrap();
+
+        let other_type = match content.content_type {
+            XingtuContentType::Live => XingtuContentType::Video,
+            XingtuContentType::Video => XingtuContentType::Live,
+        };
+        let mut other = content;
+        other.content_type = other_type;
+        other.xingtu_task.task_id.push_str("-other");
+        validate_activity_contents(&[other]).unwrap();
+    }
+
+    #[test]
+    fn activity_config_rejects_all_disabled_contents() {
+        let configs: Vec<ActivityConfig> =
+            serde_json::from_str(include_str!("../../a-config-example.json")).unwrap();
+        let mut content = configs[0].contents[0].clone();
+        content.sync_enabled = false;
+        assert!(validate_activity_contents(&[content]).is_err());
+    }
+
+    #[test]
+    fn activity_config_accepts_content_without_audit_table() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../../a-config-example.json")).unwrap();
+        value[0]["contents"][0]["tables"]
+            .as_object_mut()
+            .unwrap()
+            .remove("audit_table_id");
+
+        let configs: Vec<ActivityConfig> = serde_json::from_value(value).unwrap();
+        assert!(configs[0].contents[0].tables.audit_table_id.is_none());
+        validate_activity_config(&configs[0]).unwrap();
+    }
+
+    #[test]
+    fn blank_audit_table_is_normalized_to_database_null() {
+        assert_eq!(trim_optional(Some("   ")), None);
+        assert_eq!(trim_optional(None), None);
+    }
+
+    #[test]
+    fn workflow_config_accepts_audit_notice_alias() {
+        for field in ["morning_workflow_enabled", "audit_notice_enabled"] {
+            let value = serde_json::json!({ (field): false });
+            let config: WorkflowConfig = serde_json::from_value(value).unwrap();
+            assert!(!config.morning_workflow_enabled);
         }
     }
 

@@ -631,7 +631,8 @@ pub struct ActivityContentAdminDto {
     pub source_spreadsheet_url_update_mode: String,
     pub manual_table_id: Option<String>,
     pub main_table_id: String,
-    pub audit_table_id: String,
+    /// 可选；为空时不写审核表、不回写审核结果、不统计审核通知。
+    pub audit_table_id: Option<String>,
     pub data_source_field: String,
     pub spreadsheet_source_value: String,
     pub manual_source_value: String,
@@ -655,6 +656,8 @@ pub struct ActivityDetailDto {
 struct UpdateActivityStatusRequest {
     is_active: Option<bool>,
     need_trace: Option<bool>,
+    /// 是否发送 morning 审核通知；关闭不影响数据同步。
+    #[serde(alias = "audit_notice_enabled")]
     morning_review_enabled: Option<bool>,
     periodic_sync_enabled: Option<bool>,
 }
@@ -1919,7 +1922,7 @@ async fn system_status(depot: &mut Depot) -> ApiResult<SystemStatusDto> {
             (SELECT COUNT(*) FROM xingtu_data_quarantine WHERE resolved_at IS NULL) AS unresolved_quarantine_rows,
             (SELECT COUNT(*) FROM xingtu_project_account WHERE is_active = true AND session_status = 'invalid') AS invalid_accounts,
             (SELECT MAX(finished_at) FROM workflow_run WHERE status = 'succeeded') AS latest_success_at,
-            (SELECT MAX(finished_at) FROM workflow_run WHERE status = 'failed') AS latest_failure_at
+            (SELECT MAX(finished_at) FROM workflow_run WHERE status IN ('failed', 'partial_failed')) AS latest_failure_at
         "#,
     )
     .fetch_one(&state.pool)
@@ -2726,6 +2729,14 @@ mod tests {
             periodic_sync_enabled: None,
         };
         assert!(validate_activity_status_update(&body).is_err());
+    }
+
+    #[test]
+    fn activity_status_accepts_audit_notice_alias() {
+        let body: UpdateActivityStatusRequest =
+            serde_json::from_value(serde_json::json!({ "audit_notice_enabled": false })).unwrap();
+        assert_eq!(body.morning_review_enabled, Some(false));
+        assert!(validate_activity_status_update(&body).is_ok());
     }
 
     #[test]
