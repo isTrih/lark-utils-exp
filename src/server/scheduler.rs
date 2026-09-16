@@ -13,7 +13,7 @@ const MORNING_TIME: NaiveTime = NaiveTime::from_hms_opt(9, 0, 0).expect("valid t
 const NIGHT_TIME: NaiveTime = NaiveTime::from_hms_opt(23, 59, 0).expect("valid time");
 const LOGIN_CHECK_TIME: NaiveTime = NaiveTime::from_hms_opt(0, 30, 0).expect("valid time");
 const ORPHAN_RECOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const ORPHAN_MINIMUM_AGE: Duration = Duration::from_secs(2 * 60);
+const ORPHAN_MINIMUM_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// 启动内置调度器。
 ///

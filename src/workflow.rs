@@ -47,6 +47,7 @@ const MAX_PROJECT_MAX_ATTEMPTS: u32 = 5;
 const DEFAULT_PROJECT_RETRY_DELAY_SECONDS: u64 = 15;
 const MIN_PROJECT_RETRY_DELAY_SECONDS: u64 = 1;
 const MAX_PROJECT_RETRY_DELAY_SECONDS: u64 = 5 * 60;
+const WORKFLOW_LOCK_HEARTBEAT_SECONDS: u64 = 15;
 
 #[derive(Debug)]
 pub(crate) struct WorkflowBusyError;
@@ -127,7 +128,6 @@ struct ActivityWorkflowResult {
 
 struct WorkflowBatchOutcome {
     result: WorkflowRunResult,
-    errors: Vec<anyhow::Error>,
 }
 
 /// 单次手动登记专项同步结果。
@@ -243,7 +243,7 @@ impl XingtuWorkflowService {
         request_id: Option<&str>,
     ) -> anyhow::Result<WorkflowRunResult> {
         let _guard = self.write_lock.lock().await;
-        let (run_id, lock_tx) = self
+        let (run_id, mut lock_tx) = self
             .begin_exclusive_run(
                 kind.trigger_type(),
                 activity_period_id,
@@ -251,9 +251,30 @@ impl XingtuWorkflowService {
                 request_id,
             )
             .await?;
-        let outcome = self
-            .run_workflow_inner(run_id, kind, activity_period_id)
-            .await;
+        let outcome = {
+            let workflow = self.run_workflow_inner(run_id, kind, activity_period_id);
+            tokio::pin!(workflow);
+            let mut heartbeat =
+                tokio::time::interval(Duration::from_secs(WORKFLOW_LOCK_HEARTBEAT_SECONDS));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await;
+
+            loop {
+                tokio::select! {
+                    outcome = &mut workflow => break outcome,
+                    _ = heartbeat.tick() => {
+                        if let Err(error) = sqlx::query("SELECT 1")
+                            .execute(&mut *lock_tx)
+                            .await
+                        {
+                            break Err(error).context(
+                                "跨实例工作流锁心跳失败，已停止当前工作流以避免并发重复执行",
+                            );
+                        }
+                    }
+                }
+            }
+        };
         match &outcome {
             Ok(outcome) if outcome.result.failed_activities.is_empty() => {
                 self.workflow_run_repo
@@ -292,13 +313,8 @@ impl XingtuWorkflowService {
         }
         lock_tx.commit().await.context("释放跨实例工作流锁失败")?;
 
-        match &outcome {
-            Ok(outcome) => {
-                for error in &outcome.errors {
-                    self.send_workflow_error_notices(kind, error).await;
-                }
-            }
-            Err(error) => self.send_workflow_error_notices(kind, error).await,
+        if let Err(error) = &outcome {
+            self.send_workflow_error_notices(kind, error).await;
         }
 
         outcome.map(|outcome| outcome.result)
@@ -346,6 +362,9 @@ impl XingtuWorkflowService {
                             project_retry_delay,
                         )
                         .await;
+                    if let Err(error) = &result {
+                        service.send_workflow_error_notices(kind, error).await;
+                    }
                     (activity_scope, result)
                 }
             })
@@ -399,8 +418,9 @@ impl XingtuWorkflowService {
                 Ok(result) => result,
                 Err(_) => {
                     let message = format!(
-                        "活动期次 `{}` 执行超过 {} 秒，已取消并继续处理后续项目",
+                        "活动期次 `{}` account_id={} 执行超过 {} 秒，已取消并继续处理后续项目",
                         activity_scope.activity_period_id,
+                        activity_scope.xingtu_account_id,
                         project_timeout.as_secs()
                     );
                     if let Err(error) = self
@@ -1507,7 +1527,6 @@ fn aggregate_activity_outcomes(
     let mut audit_notice_sent = false;
     let mut processed_activity_period_ids = Vec::new();
     let mut failed_activities = Vec::new();
-    let mut errors = Vec::new();
 
     for (scope, result) in outcomes {
         match result {
@@ -1540,7 +1559,6 @@ fn aggregate_activity_outcomes(
                     xingtu_account_id: scope.xingtu_account_id,
                     error: bounded_workflow_error(&error),
                 });
-                errors.push(error);
             }
         }
     }
@@ -1557,7 +1575,6 @@ fn aggregate_activity_outcomes(
             audit_notice_sent,
             failed_activities,
         },
-        errors,
     }
 }
 
@@ -1729,7 +1746,6 @@ mod tests {
         assert_eq!(outcome.result.synced_activities, 2);
         assert_eq!(outcome.result.failed_activities.len(), 1);
         assert_eq!(outcome.result.failed_activities[0].activity_period_id, 10);
-        assert_eq!(outcome.errors.len(), 1);
     }
 
     #[test]

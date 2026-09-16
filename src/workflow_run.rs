@@ -142,6 +142,18 @@ impl WorkflowRunRepository {
         code: &str,
         error: &str,
     ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            UPDATE workflow_step
+            SET status = 'failed', finished_at = now(), error_message = $2
+            WHERE workflow_run_id = $1 AND status = 'running'
+            "#,
+        )
+        .bind(run_id)
+        .bind(truncate_error(error))
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE workflow_run SET status = $2, finished_at = now(), error_code = $3, error_message = $4 WHERE workflow_run_id = $1",
         )
@@ -149,8 +161,9 @@ impl WorkflowRunRepository {
         .bind(status)
         .bind(code)
         .bind(truncate_error(error))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -380,7 +393,7 @@ impl WorkflowRunRepository {
             r#"
             UPDATE workflow_step
             SET status = 'failed', finished_at = now(),
-                error_message = COALESCE(error_message, '服务异常退出，阶段台账由启动恢复标记失败')
+                error_message = COALESCE(error_message, '工作流进程失联，阶段台账由孤儿恢复标记失败')
             WHERE status = 'running' AND workflow_run_id IN (
                 SELECT workflow_run_id
                 FROM workflow_run
@@ -396,7 +409,7 @@ impl WorkflowRunRepository {
             r#"
             UPDATE workflow_run
             SET status = 'failed', finished_at = now(), error_code = 'stale_run',
-                error_message = COALESCE(error_message, '服务异常退出，运行台账由启动恢复标记失败')
+                error_message = COALESCE(error_message, '工作流进程失联，运行台账由孤儿恢复标记失败')
             WHERE status = 'running'
                 AND started_at < now() - make_interval(secs => $1)
             "#,
