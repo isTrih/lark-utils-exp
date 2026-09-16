@@ -204,6 +204,29 @@ impl WorkflowRunRepository {
         Ok(())
     }
 
+    pub async fn fail_running_steps_for_activity(
+        &self,
+        run_id: i64,
+        activity_period_id: i64,
+        error: &str,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE workflow_step
+            SET status = 'failed', finished_at = now(), error_message = $3
+            WHERE workflow_run_id = $1
+              AND activity_period_id = $2
+              AND status = 'running'
+            "#,
+        )
+        .bind(run_id)
+        .bind(activity_period_id)
+        .bind(truncate_error(error))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn list_runs(
         &self,
         limit: i64,
@@ -326,17 +349,44 @@ impl WorkflowRunRepository {
         Ok(())
     }
 
-    /// 服务异常退出会遗留 running 台账；只回收远超正常执行窗口的记录，避免误伤其他实例。
-    pub async fn reconcile_stale_runs(&self, max_age: Duration) -> anyhow::Result<u64> {
-        let seconds = i32::try_from(max_age.as_secs()).unwrap_or(i32::MAX);
-        let mut tx = self.pool.begin().await?;
+    /// 仅在没有其他实例持有全局工作流锁时回收孤儿台账。
+    ///
+    /// 最小存活时间用于规避“创建运行记录”和“取得全局锁”之间的极短竞态；事务级锁则
+    /// 保证不会把另一台仍在正常执行的实例误判成异常退出。
+    pub async fn reconcile_orphaned_runs_if_idle(
+        &self,
+        minimum_age: Duration,
+    ) -> anyhow::Result<u64> {
+        let seconds = i32::try_from(minimum_age.as_secs()).unwrap_or(i32::MAX);
+        let has_candidate: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM workflow_run
+                WHERE status = 'running'
+                  AND started_at < now() - make_interval(secs => $1)
+            )
+            "#,
+        )
+        .bind(seconds)
+        .fetch_one(&self.pool)
+        .await?;
+        if !has_candidate {
+            return Ok(0);
+        }
+        let Some(mut tx) = self.try_acquire_global_lock().await? else {
+            return Ok(0);
+        };
         sqlx::query(
             r#"
             UPDATE workflow_step
             SET status = 'failed', finished_at = now(),
                 error_message = COALESCE(error_message, '服务异常退出，阶段台账由启动恢复标记失败')
-            WHERE status = 'running'
-                AND started_at < now() - make_interval(secs => $1)
+            WHERE status = 'running' AND workflow_run_id IN (
+                SELECT workflow_run_id
+                FROM workflow_run
+                WHERE status = 'running'
+                  AND started_at < now() - make_interval(secs => $1)
+            )
             "#,
         )
         .bind(seconds)

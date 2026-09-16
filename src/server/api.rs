@@ -504,10 +504,13 @@ async fn run_workflow(
     let activity_period_id = workflow_activity_period_id(body.into_inner())?;
     let request_id = request_id_from_depot(depot);
     let result = state
-        .workflow
-        .run_workflow(kind, activity_period_id, "http", Some(&request_id))
-        .await;
-    let result = crate::server::cache::invalidate_after_write(&state.query_cache, result).await?;
+        .run_workflow_independent(
+            kind,
+            activity_period_id,
+            "http".to_owned(),
+            Some(request_id),
+        )
+        .await?;
 
     Ok(Json(WorkflowRunResponse {
         ok: true,

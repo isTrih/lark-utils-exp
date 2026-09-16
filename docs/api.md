@@ -312,6 +312,13 @@ curl -X POST "https://api.example.com/api/v1/xingtu/sessions/check-all"
 pending 来源导入 -> 数据库及飞书表同步 -> 夜间审核结果回写或早间审核通知”的顺序执行。
 单个项目失败不会中止其他项目；全部结束后统一汇总成功期次和失败详情。
 
+单个项目完整流程受 `WORKFLOW_PROJECT_TIMEOUT_SECONDS` 总时间预算限制，默认 3600 秒。
+可恢复的网络、上游服务和临时数据库错误会在该预算内自动重试，最大尝试次数由
+`WORKFLOW_PROJECT_MAX_ATTEMPTS` 控制（默认 3）；初始退避由
+`WORKFLOW_PROJECT_RETRY_DELAY_SECONDS` 控制（默认 15 秒）。登录态失效、权限或确定性配置错误
+不会执行无效重试。服务每 5 分钟巡检一次异常退出遗留的运行台账，在确认没有其他实例执行工作流后，
+会回收孤儿任务并自动发起一次周期同步补偿。
+
 路径参数：
 
 | 参数 | 可选值 | 说明 |

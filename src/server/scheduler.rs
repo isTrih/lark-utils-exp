@@ -12,6 +12,8 @@ const PERIODIC_TIMES: [NaiveTime; 2] = [
 const MORNING_TIME: NaiveTime = NaiveTime::from_hms_opt(9, 0, 0).expect("valid time");
 const NIGHT_TIME: NaiveTime = NaiveTime::from_hms_opt(23, 59, 0).expect("valid time");
 const LOGIN_CHECK_TIME: NaiveTime = NaiveTime::from_hms_opt(0, 30, 0).expect("valid time");
+const ORPHAN_RECOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const ORPHAN_MINIMUM_AGE: Duration = Duration::from_secs(2 * 60);
 
 /// 启动内置调度器。
 ///
@@ -26,6 +28,10 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
         next_daily_local_time(NIGHT_TIME),
         next_daily_local_time(LOGIN_CHECK_TIME),
     );
+    tokio::spawn(run_orphan_recovery_loop(
+        state.clone(),
+        state.recovered_workflow_runs > 0,
+    ));
     for time in PERIODIC_TIMES {
         tokio::spawn(run_daily_workflow_loop(
             state.clone(),
@@ -44,6 +50,57 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
         NIGHT_TIME,
     ));
     tokio::spawn(run_login_check_loop(state));
+}
+
+async fn run_orphan_recovery_loop(state: Arc<AppState>, mut catch_up_required: bool) {
+    loop {
+        if catch_up_required {
+            tracing::warn!("检测到异常中断的工作流，开始执行一次周期同步补偿");
+            let result = state
+                .workflow
+                .run_workflow(WorkflowKind::Periodic, None, "orphan_recovery", None)
+                .await;
+            if let Err(error) = state.query_cache.invalidate_all_shared().await {
+                tracing::error!(error = ?error, "工作流补偿后跨实例失效查询缓存失败");
+            }
+            match result {
+                Ok(result) if result.failed_activities.is_empty() => {
+                    tracing::info!(
+                        processed_activity_period_ids = ?result.processed_activity_period_ids,
+                        "异常中断工作流的数据同步补偿成功"
+                    );
+                }
+                Ok(result) => {
+                    tracing::error!(
+                        processed_activity_period_ids = ?result.processed_activity_period_ids,
+                        failed_activities = ?result.failed_activities,
+                        "异常中断工作流的数据同步补偿存在项目失败"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(error = ?error, "异常中断工作流的数据同步补偿失败");
+                }
+            }
+            catch_up_required = false;
+        }
+
+        tokio::time::sleep(ORPHAN_RECOVERY_INTERVAL).await;
+        match state
+            .workflow
+            .workflow_run_repo
+            .reconcile_orphaned_runs_if_idle(ORPHAN_MINIMUM_AGE)
+            .await
+        {
+            Ok(0) => {}
+            Ok(recovered_runs) => {
+                tracing::warn!(recovered_runs, "已回收异常中断的工作流，准备补偿同步");
+                catch_up_required = true;
+            }
+            Err(error) => {
+                tracing::error!(error = ?error, "巡检异常中断工作流失败");
+            }
+        }
+    }
 }
 
 async fn run_daily_workflow_loop(state: Arc<AppState>, kind: WorkflowKind, time: NaiveTime) {

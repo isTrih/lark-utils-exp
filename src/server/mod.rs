@@ -73,7 +73,7 @@ pub async fn build_app_state() -> anyhow::Result<Arc<AppState>> {
     let message_history_repo = CardMessageHistoryRepository::new(pool.clone());
     let workflow_run_repo = WorkflowRunRepository::new(pool.clone());
     let recovered_runs = workflow_run_repo
-        .reconcile_stale_runs(std::time::Duration::from_secs(6 * 60 * 60))
+        .reconcile_orphaned_runs_if_idle(std::time::Duration::from_secs(2 * 60))
         .await
         .context("恢复异常中断的工作流台账失败")?;
     let session_registry = XingtuSessionRegistry::new();
@@ -101,7 +101,7 @@ pub async fn build_app_state() -> anyhow::Result<Arc<AppState>> {
         tracing::info!("已从 .env 注入调试星图登录态");
     }
 
-    Ok(Arc::new(AppState::new(pool, workflow)))
+    Ok(Arc::new(AppState::new(pool, workflow, recovered_runs)))
 }
 
 /// 构建 Salvo 路由。

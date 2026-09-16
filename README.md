@@ -101,6 +101,9 @@ cargo run --bin server
 | `RUST_LOG` | 可选 | 默认 `info`。`debug` 会包含较多 HTTP/OpenLark 底层日志。 |
 | `LOG_DIR` | 可选 | 持久化 JSONL 日志目录；Docker 默认 `/app/logs`。控制台与文件时间戳均为北京时间并带 `+08:00` 偏移。 |
 | `WORKFLOW_PROJECT_CONCURRENCY` | 可选 | 自动工作流的项目级并发数，默认 `3`，范围 `1-16`；单项目内部仍按顺序执行。 |
+| `WORKFLOW_PROJECT_TIMEOUT_SECONDS` | 可选 | 单项目完整工作流超时，默认 `3600` 秒，范围 `300-21600`；超时后释放并发槽并继续其他项目。 |
+| `WORKFLOW_PROJECT_MAX_ATTEMPTS` | 可选 | 单项目遇到可恢复错误时的最大尝试次数，默认 `3`，范围 `1-5`；登录态和配置错误不会重试。 |
+| `WORKFLOW_PROJECT_RETRY_DELAY_SECONDS` | 可选 | 单项目自动重试的初始等待秒数，默认 `15`，范围 `1-300`，随后指数退避且最长等待 300 秒。 |
 
 ### 鉴权与密钥
 

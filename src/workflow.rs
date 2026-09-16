@@ -39,6 +39,14 @@ use tokio::sync::Mutex;
 
 const DEFAULT_PROJECT_CONCURRENCY: usize = 3;
 const MAX_PROJECT_CONCURRENCY: usize = 16;
+const DEFAULT_PROJECT_TIMEOUT_SECONDS: u64 = 60 * 60;
+const MIN_PROJECT_TIMEOUT_SECONDS: u64 = 5 * 60;
+const MAX_PROJECT_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
+const DEFAULT_PROJECT_MAX_ATTEMPTS: u32 = 3;
+const MAX_PROJECT_MAX_ATTEMPTS: u32 = 5;
+const DEFAULT_PROJECT_RETRY_DELAY_SECONDS: u64 = 15;
+const MIN_PROJECT_RETRY_DELAY_SECONDS: u64 = 1;
+const MAX_PROJECT_RETRY_DELAY_SECONDS: u64 = 5 * 60;
 
 #[derive(Debug)]
 pub(crate) struct WorkflowBusyError;
@@ -309,11 +317,17 @@ impl XingtuWorkflowService {
             .await
             .context("读取当前自动工作流活动失败")?;
         let project_concurrency = workflow_project_concurrency();
+        let project_timeout = workflow_project_timeout();
+        let project_max_attempts = workflow_project_max_attempts();
+        let project_retry_delay = workflow_project_retry_delay();
         tracing::info!(
             workflow = kind.trigger_type(),
             requested_activity_period_id = ?activity_period_id,
             activity_scopes = ?activity_scopes,
             project_concurrency,
+            project_timeout_seconds = project_timeout.as_secs(),
+            project_max_attempts,
+            project_retry_delay_seconds = project_retry_delay.as_secs(),
             "自动工作流已确定并行项目范围"
         );
         let mut outcomes = stream::iter(activity_scopes.into_iter().enumerate())
@@ -321,12 +335,15 @@ impl XingtuWorkflowService {
                 let service = self.clone();
                 async move {
                     let result = service
-                        .run_activity_workflow(
+                        .run_activity_workflow_with_retry(
                             workflow_run_id,
                             kind,
                             activity_scope.clone(),
                             pull_started_at,
                             index > 0,
+                            project_timeout,
+                            project_max_attempts,
+                            project_retry_delay,
                         )
                         .await;
                     (activity_scope, result)
@@ -337,6 +354,133 @@ impl XingtuWorkflowService {
             .await;
         outcomes.sort_by_key(|(scope, _)| scope.activity_period_id);
         Ok(aggregate_activity_outcomes(workflow_run_id, kind, outcomes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_activity_workflow_with_retry(
+        &self,
+        workflow_run_id: i64,
+        kind: WorkflowKind,
+        activity_scope: WorkflowActivityScope,
+        pull_started_at: chrono::DateTime<Utc>,
+        jitter_before_first_export: bool,
+        project_timeout: Duration,
+        max_attempts: u32,
+        retry_delay: Duration,
+    ) -> anyhow::Result<ActivityWorkflowResult> {
+        let deadline = tokio::time::Instant::now() + project_timeout;
+
+        for attempt in 1..=max_attempts {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tracing::info!(
+                workflow = kind.trigger_type(),
+                project_id = activity_scope.project_id,
+                activity_period_id = activity_scope.activity_period_id,
+                attempt,
+                max_attempts,
+                remaining_seconds = remaining.as_secs(),
+                "开始执行项目工作流尝试"
+            );
+            let result = match tokio::time::timeout(
+                remaining,
+                self.run_activity_workflow(
+                    workflow_run_id,
+                    kind,
+                    activity_scope.clone(),
+                    pull_started_at,
+                    jitter_before_first_export,
+                ),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    let message = format!(
+                        "活动期次 `{}` 执行超过 {} 秒，已取消并继续处理后续项目",
+                        activity_scope.activity_period_id,
+                        project_timeout.as_secs()
+                    );
+                    if let Err(error) = self
+                        .workflow_run_repo
+                        .fail_running_steps_for_activity(
+                            workflow_run_id,
+                            activity_scope.activity_period_id,
+                            "项目工作流执行超时，已取消当前步骤并释放并发槽",
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            workflow_run_id,
+                            activity_period_id = activity_scope.activity_period_id,
+                            error = ?error,
+                            "记录项目工作流超时失败"
+                        );
+                    }
+                    return Err(anyhow!(message));
+                }
+            };
+
+            match result {
+                Ok(result) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            workflow = kind.trigger_type(),
+                            project_id = activity_scope.project_id,
+                            activity_period_id = activity_scope.activity_period_id,
+                            attempt,
+                            "项目工作流自动重试成功"
+                        );
+                    }
+                    return Ok(result);
+                }
+                Err(error) if attempt < max_attempts && is_retryable_workflow_error(&error) => {
+                    let delay = retry_delay_for_attempt(retry_delay, attempt);
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if delay >= remaining {
+                        return Err(error).context(format!(
+                            "活动期次 `{}` 已没有足够的项目执行预算用于自动重试",
+                            activity_scope.activity_period_id
+                        ));
+                    }
+                    tracing::warn!(
+                        workflow = kind.trigger_type(),
+                        project_id = activity_scope.project_id,
+                        activity_period_id = activity_scope.activity_period_id,
+                        attempt,
+                        next_attempt = attempt + 1,
+                        retry_delay_seconds = delay.as_secs(),
+                        error = ?error,
+                        "项目工作流发生可恢复错误，将自动重试"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => {
+                    if attempt < max_attempts {
+                        tracing::warn!(
+                            workflow = kind.trigger_type(),
+                            project_id = activity_scope.project_id,
+                            activity_period_id = activity_scope.activity_period_id,
+                            attempt,
+                            error = ?error,
+                            "项目工作流发生确定性错误，不执行无效重试"
+                        );
+                    }
+                    return Err(error).context(format!(
+                        "活动期次 `{}` 工作流执行失败（尝试 {attempt}/{max_attempts}）",
+                        activity_scope.activity_period_id
+                    ));
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "活动期次 `{}` 已耗尽 {} 秒项目执行预算",
+            activity_scope.activity_period_id,
+            project_timeout.as_secs()
+        ))
     }
 
     async fn run_activity_workflow(
@@ -1235,6 +1379,114 @@ fn workflow_project_concurrency() -> usize {
     }
 }
 
+fn workflow_project_timeout() -> Duration {
+    Duration::from_secs(parse_workflow_project_timeout_seconds(
+        env::var("WORKFLOW_PROJECT_TIMEOUT_SECONDS").ok().as_deref(),
+    ))
+}
+
+fn parse_workflow_project_timeout_seconds(value: Option<&str>) -> u64 {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return DEFAULT_PROJECT_TIMEOUT_SECONDS;
+    };
+    match value.parse::<u64>() {
+        Ok(seconds) => seconds.clamp(MIN_PROJECT_TIMEOUT_SECONDS, MAX_PROJECT_TIMEOUT_SECONDS),
+        Err(error) => {
+            tracing::warn!(
+                value,
+                error = ?error,
+                default_seconds = DEFAULT_PROJECT_TIMEOUT_SECONDS,
+                "WORKFLOW_PROJECT_TIMEOUT_SECONDS 无效，使用默认值"
+            );
+            DEFAULT_PROJECT_TIMEOUT_SECONDS
+        }
+    }
+}
+
+fn workflow_project_max_attempts() -> u32 {
+    parse_workflow_project_max_attempts(env::var("WORKFLOW_PROJECT_MAX_ATTEMPTS").ok().as_deref())
+}
+
+fn parse_workflow_project_max_attempts(value: Option<&str>) -> u32 {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return DEFAULT_PROJECT_MAX_ATTEMPTS;
+    };
+    match value.parse::<u32>() {
+        Ok(attempts) => attempts.clamp(1, MAX_PROJECT_MAX_ATTEMPTS),
+        Err(error) => {
+            tracing::warn!(
+                value,
+                error = ?error,
+                default = DEFAULT_PROJECT_MAX_ATTEMPTS,
+                "WORKFLOW_PROJECT_MAX_ATTEMPTS 无效，使用默认值"
+            );
+            DEFAULT_PROJECT_MAX_ATTEMPTS
+        }
+    }
+}
+
+fn workflow_project_retry_delay() -> Duration {
+    Duration::from_secs(parse_workflow_project_retry_delay_seconds(
+        env::var("WORKFLOW_PROJECT_RETRY_DELAY_SECONDS")
+            .ok()
+            .as_deref(),
+    ))
+}
+
+fn parse_workflow_project_retry_delay_seconds(value: Option<&str>) -> u64 {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return DEFAULT_PROJECT_RETRY_DELAY_SECONDS;
+    };
+    match value.parse::<u64>() {
+        Ok(seconds) => seconds.clamp(
+            MIN_PROJECT_RETRY_DELAY_SECONDS,
+            MAX_PROJECT_RETRY_DELAY_SECONDS,
+        ),
+        Err(error) => {
+            tracing::warn!(
+                value,
+                error = ?error,
+                default_seconds = DEFAULT_PROJECT_RETRY_DELAY_SECONDS,
+                "WORKFLOW_PROJECT_RETRY_DELAY_SECONDS 无效，使用默认值"
+            );
+            DEFAULT_PROJECT_RETRY_DELAY_SECONDS
+        }
+    }
+}
+
+fn retry_delay_for_attempt(base_delay: Duration, completed_attempts: u32) -> Duration {
+    let multiplier = 1_u64 << completed_attempts.saturating_sub(1).min(8);
+    Duration::from_secs(
+        base_delay
+            .as_secs()
+            .saturating_mul(multiplier)
+            .min(MAX_PROJECT_RETRY_DELAY_SECONDS),
+    )
+}
+
+fn is_retryable_workflow_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    let lowercase = message.to_ascii_lowercase();
+    let permanent_markers = [
+        "未登录",
+        "登录态",
+        "登陆态",
+        "未配置",
+        "不能为空",
+        "不支持",
+        "不存在或未启用",
+        "fieldnamenotfound",
+        "permission denied",
+        "forbidden",
+        "cookie",
+        "csrf",
+    ];
+
+    !permanent_markers
+        .iter()
+        .any(|marker| message.contains(marker) || lowercase.contains(marker))
+}
+
 fn bounded_workflow_error(error: &anyhow::Error) -> String {
     const MAX_CHARS: usize = 4_000;
     format!("{error:#}").chars().take(MAX_CHARS).collect()
@@ -1601,5 +1853,44 @@ mod tests {
         assert!(detail.contains("错误信息:星图长任务失败：status=4 reason=文档创建失败"));
         assert!(detail.contains("project=ROK"));
         assert!(detail.contains("账号ID:demo-xingtu-account"));
+    }
+
+    #[test]
+    fn project_retry_settings_have_safe_defaults_and_bounds() {
+        assert_eq!(parse_workflow_project_max_attempts(None), 3);
+        assert_eq!(parse_workflow_project_max_attempts(Some("0")), 1);
+        assert_eq!(parse_workflow_project_max_attempts(Some("20")), 5);
+        assert_eq!(parse_workflow_project_retry_delay_seconds(None), 15);
+        assert_eq!(parse_workflow_project_retry_delay_seconds(Some("0")), 1);
+        assert_eq!(parse_workflow_project_retry_delay_seconds(Some("999")), 300);
+        assert_eq!(parse_workflow_project_timeout_seconds(None), 3_600);
+        assert_eq!(parse_workflow_project_timeout_seconds(Some("1")), 300);
+        assert_eq!(
+            parse_workflow_project_timeout_seconds(Some("999999")),
+            21_600
+        );
+    }
+
+    #[test]
+    fn project_retry_uses_bounded_exponential_backoff() {
+        let base = Duration::from_secs(15);
+        assert_eq!(retry_delay_for_attempt(base, 1), Duration::from_secs(15));
+        assert_eq!(retry_delay_for_attempt(base, 2), Duration::from_secs(30));
+        assert_eq!(retry_delay_for_attempt(base, 3), Duration::from_secs(60));
+        assert_eq!(
+            retry_delay_for_attempt(Duration::from_secs(300), 5),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn project_retry_skips_permanent_auth_and_configuration_errors() {
+        assert!(!is_retryable_workflow_error(&anyhow!(
+            "星图接口失败：用户未登录"
+        )));
+        assert!(!is_retryable_workflow_error(&anyhow!("项目未配置飞书应用")));
+        assert!(!is_retryable_workflow_error(&anyhow!("FieldNameNotFound")));
+        assert!(is_retryable_workflow_error(&anyhow!("连接飞书服务超时")));
+        assert!(is_retryable_workflow_error(&anyhow!("服务端返回 503")));
     }
 }
