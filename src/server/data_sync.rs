@@ -43,9 +43,35 @@ pub fn routes() -> Router {
         .push(Router::with_path("data-sync/config/app.js").get(config_js))
         .push(
             Router::with_path("api/data-sync")
+                .push(Router::with_path("projects").get(connector_projects))
                 .push(Router::with_path("table-meta").post(table_meta))
                 .push(Router::with_path("records").post(connector_records)),
         )
+}
+
+#[derive(Debug, Serialize)]
+struct ConnectorProjectOption {
+    activity_period_id: i64,
+    project_display_name: String,
+    period: String,
+}
+
+/// 飞书连接器配置页专用的最小项目清单，不返回看板指标或项目管理配置。
+#[handler]
+async fn connector_projects(
+    depot: &mut Depot,
+) -> crate::server::error::ApiResult<Vec<ConnectorProjectOption>> {
+    let state = state_from_depot(depot)?;
+    let projects = crate::server::query::list_current_projects(&state.pool)
+        .await?
+        .into_iter()
+        .map(|project| ConnectorProjectOption {
+            activity_period_id: project.activity_period_id,
+            project_display_name: project.project_display_name,
+            period: project.period,
+        })
+        .collect();
+    Ok(Json(projects))
 }
 
 #[handler]

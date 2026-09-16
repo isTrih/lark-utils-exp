@@ -35,6 +35,11 @@ metadata，例如 `0.2.0+build.20260806T010203Z.git.fa2eb7ca7c9e`。发布脚本
 DATABASE_URL=postgres://user:password@host:5432/database
 LARK_APP_ID=cli_xxx
 LARK_APP_SECRET=xxx
+# 飞书 OAuth 登录；回调地址需同时配置到飞书开放平台安全设置。
+AUTH_JWT_SECRET=replace-with-at-least-32-random-bytes
+AUTH_REDIRECT_URIS=["https://dashboard.example.com/login"]
+# 可选：可信内部服务只读查询 Token，不能调用管理和写接口。
+INTERNAL_API_TOKEN=replace-with-a-different-read-only-token
 # 推荐为项目级飞书应用凭据配置独立的 32 字节标准 Base64 根密钥。
 LARK_PROJECT_CREDENTIAL_ENCRYPTION_KEY=replace-with-32-byte-standard-base64-key
 LARK_PROJECT_CREDENTIAL_ENCRYPTION_KEY_ID=primary

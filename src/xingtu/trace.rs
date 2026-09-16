@@ -281,7 +281,7 @@ async fn trace_single_content(
 
 /// 根据拉取开始时间计算数据归属日期。
 ///
-/// 23:59 发起拉取但次日才拿到 URL 时，仍然归属拉取开始当天。
+/// 23:59:59 发起拉取但次日才拿到 URL 时，仍然归属拉取开始当天。
 fn stat_date_from_pull_started_at(pull_started_at: DateTime<Utc>) -> NaiveDate {
     pull_started_at.with_timezone(&Shanghai).date_naive()
 }

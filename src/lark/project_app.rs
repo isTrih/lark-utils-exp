@@ -27,6 +27,15 @@ pub struct ProjectFeishuAppBinding {
     pub binding_updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FeishuLoginApp {
+    pub feishu_app_id: Option<i64>,
+    pub app_id: String,
+    pub app_secret: String,
+    pub display_name: String,
+    pub is_default: bool,
+}
+
 #[derive(Clone)]
 struct CachedProjectClient {
     app_id: String,
@@ -41,6 +50,8 @@ pub struct ProjectFeishuAppStore {
     cipher: ProjectFeishuCredentialCipher,
     fallback_client: LarkClient,
     fallback_base_url: String,
+    fallback_app_id: String,
+    fallback_app_secret: String,
     clients: Arc<RwLock<HashMap<i64, CachedProjectClient>>>,
 }
 
@@ -56,8 +67,57 @@ impl ProjectFeishuAppStore {
             cipher,
             fallback_client,
             fallback_base_url: fallback_config.lark_base_url,
+            fallback_app_id: fallback_config.lark_app_id,
+            fallback_app_secret: fallback_config.lark_app_secret,
             clients: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub fn default_login_app(&self) -> FeishuLoginApp {
+        FeishuLoginApp {
+            feishu_app_id: None,
+            app_id: self.fallback_app_id.clone(),
+            app_secret: self.fallback_app_secret.clone(),
+            display_name: "默认飞书应用".to_owned(),
+            is_default: true,
+        }
+    }
+
+    pub async fn login_app(&self, feishu_app_id: i64) -> anyhow::Result<Option<FeishuLoginApp>> {
+        let row = sqlx::query(
+            r#"
+            SELECT feishu_app_id, app_id, display_name, encrypted_app_secret,
+                encryption_key_id, is_active
+            FROM xingtu_feishu_app
+            WHERE feishu_app_id = $1
+            "#,
+        )
+        .bind(feishu_app_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if !row.try_get::<bool, _>("is_active")? {
+            return Err(anyhow!("飞书应用已停用：{feishu_app_id}"));
+        }
+        let app_id: String = row.try_get("app_id")?;
+        let encryption_key_id: String = row.try_get("encryption_key_id")?;
+        if encryption_key_id != self.cipher.key_id() {
+            return Err(anyhow!(
+                "飞书应用 {feishu_app_id} 的密钥版本与当前服务不一致"
+            ));
+        }
+        let encrypted: Vec<u8> = row.try_get("encrypted_app_secret")?;
+        Ok(Some(FeishuLoginApp {
+            feishu_app_id: Some(feishu_app_id),
+            app_secret: self
+                .cipher
+                .decrypt_app_secret(feishu_app_id, &app_id, &encrypted)?,
+            app_id,
+            display_name: row.try_get("display_name")?,
+            is_default: false,
+        }))
     }
 
     /// 项目未绑定应用时使用全局环境变量客户端，保证既有项目平滑升级。

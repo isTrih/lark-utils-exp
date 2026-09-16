@@ -27,7 +27,6 @@ use futures::{StreamExt, stream};
 use salvo::oapi::ToSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{Postgres, Transaction};
 use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -243,7 +242,39 @@ impl XingtuWorkflowService {
         request_id: Option<&str>,
     ) -> anyhow::Result<WorkflowRunResult> {
         let _guard = self.write_lock.lock().await;
-        let (run_id, mut lock_tx) = self
+        self.run_workflow_exclusive(kind, activity_period_id, trigger_source, request_id)
+            .await
+    }
+
+    /// 仅在当前实例没有写工作流运行或排队时执行。
+    ///
+    /// 定时器使用此入口，避免上一批耗时过长时把后续固定时点积压成连续补跑。
+    /// 返回 `None` 表示当前实例或其他实例已有工作流运行，本次触发已安全跳过。
+    pub async fn try_run_scheduled_workflow(
+        &self,
+        kind: WorkflowKind,
+    ) -> anyhow::Result<Option<WorkflowRunResult>> {
+        let Ok(_guard) = self.write_lock.try_lock() else {
+            return Ok(None);
+        };
+        match self
+            .run_workflow_exclusive(kind, None, "scheduler", None)
+            .await
+        {
+            Ok(result) => Ok(Some(result)),
+            Err(error) if error.downcast_ref::<WorkflowBusyError>().is_some() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn run_workflow_exclusive(
+        &self,
+        kind: WorkflowKind,
+        activity_period_id: Option<i64>,
+        trigger_source: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<WorkflowRunResult> {
+        let run_id = self
             .begin_exclusive_run(
                 kind.trigger_type(),
                 activity_period_id,
@@ -251,30 +282,12 @@ impl XingtuWorkflowService {
                 request_id,
             )
             .await?;
-        let outcome = {
-            let workflow = self.run_workflow_inner(run_id, kind, activity_period_id);
-            tokio::pin!(workflow);
-            let mut heartbeat =
-                tokio::time::interval(Duration::from_secs(WORKFLOW_LOCK_HEARTBEAT_SECONDS));
-            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            heartbeat.tick().await;
-
-            loop {
-                tokio::select! {
-                    outcome = &mut workflow => break outcome,
-                    _ = heartbeat.tick() => {
-                        if let Err(error) = sqlx::query("SELECT 1")
-                            .execute(&mut *lock_tx)
-                            .await
-                        {
-                            break Err(error).context(
-                                "跨实例工作流锁心跳失败，已停止当前工作流以避免并发重复执行",
-                            );
-                        }
-                    }
-                }
-            }
-        };
+        let outcome = self
+            .with_run_heartbeat(
+                run_id,
+                self.run_workflow_inner(run_id, kind, activity_period_id),
+            )
+            .await;
         match &outcome {
             Ok(outcome) if outcome.result.failed_activities.is_empty() => {
                 self.workflow_run_repo
@@ -311,7 +324,7 @@ impl XingtuWorkflowService {
                     .await?;
             }
         }
-        lock_tx.commit().await.context("释放跨实例工作流锁失败")?;
+        self.workflow_run_repo.release_run_lease(run_id).await?;
 
         if let Err(error) = &outcome {
             self.send_workflow_error_notices(kind, error).await;
@@ -682,7 +695,7 @@ impl XingtuWorkflowService {
         request_id: Option<&str>,
     ) -> anyhow::Result<PendingImportResult> {
         let _guard = self.write_lock.lock().await;
-        let (run_id, lock_tx) = self
+        let run_id = self
             .begin_exclusive_run(
                 "pending_import",
                 activity_period_id,
@@ -690,8 +703,8 @@ impl XingtuWorkflowService {
                 request_id,
             )
             .await?;
-        let result = self
-            .tracked_optional_step(run_id, activity_period_id, "pending_import", async {
+        let operation =
+            self.tracked_optional_step(run_id, activity_period_id, "pending_import", async {
                 let project_ids = self
                     .data_import_repo
                     .list_pending_project_ids(activity_period_id)
@@ -715,10 +728,10 @@ impl XingtuWorkflowService {
                     merge_pending_import_result(&mut total, result);
                 }
                 Ok(total)
-            })
-            .await;
+            });
+        let result = self.with_run_heartbeat(run_id, operation).await;
         self.finish_serializable_run(run_id, &result).await?;
-        lock_tx.commit().await?;
+        self.workflow_run_repo.release_run_lease(run_id).await?;
         result
     }
 
@@ -730,29 +743,28 @@ impl XingtuWorkflowService {
         request_id: Option<&str>,
     ) -> anyhow::Result<PendingImportResult> {
         let _guard = self.write_lock.lock().await;
-        let (run_id, lock_tx) = self
+        let run_id = self
             .begin_exclusive_run("source_retry", None, trigger_source, request_id)
             .await?;
-        let result = self
-            .tracked_optional_step(run_id, None, "source_retry", async {
-                if !self
-                    .data_import_repo
-                    .retry_failed_source(feishu_source_id)
-                    .await?
-                {
-                    return Err(anyhow!("未找到可重试来源：{feishu_source_id}"));
-                }
-                let project_id = self
-                    .data_import_repo
-                    .project_id_for_source(feishu_source_id)
-                    .await?
-                    .ok_or_else(|| anyhow!("未找到来源所属项目：{feishu_source_id}"))?;
-                let lark = self.project_lark.client_for_project(project_id).await?;
-                import_feishu_source_by_id(&self.data_import_repo, &lark, feishu_source_id).await
-            })
-            .await;
+        let operation = self.tracked_optional_step(run_id, None, "source_retry", async {
+            if !self
+                .data_import_repo
+                .retry_failed_source(feishu_source_id)
+                .await?
+            {
+                return Err(anyhow!("未找到可重试来源：{feishu_source_id}"));
+            }
+            let project_id = self
+                .data_import_repo
+                .project_id_for_source(feishu_source_id)
+                .await?
+                .ok_or_else(|| anyhow!("未找到来源所属项目：{feishu_source_id}"))?;
+            let lark = self.project_lark.client_for_project(project_id).await?;
+            import_feishu_source_by_id(&self.data_import_repo, &lark, feishu_source_id).await
+        });
+        let result = self.with_run_heartbeat(run_id, operation).await;
         self.finish_serializable_run(run_id, &result).await?;
-        lock_tx.commit().await?;
+        self.workflow_run_repo.release_run_lease(run_id).await?;
         result
     }
 
@@ -764,7 +776,7 @@ impl XingtuWorkflowService {
         request_id: Option<&str>,
     ) -> anyhow::Result<AuditNoticeRunResult> {
         let _guard = self.write_lock.lock().await;
-        let (run_id, lock_tx) = self
+        let run_id = self
             .begin_exclusive_run(
                 "audit_notice",
                 activity_period_id,
@@ -772,14 +784,14 @@ impl XingtuWorkflowService {
                 request_id,
             )
             .await?;
-        let result = self
-            .tracked_optional_step(run_id, activity_period_id, "audit_notice", async {
+        let operation =
+            self.tracked_optional_step(run_id, activity_period_id, "audit_notice", async {
                 self.run_audit_notice_from_db(activity_period_id, activity_period_id.is_none())
                     .await
-            })
-            .await;
+            });
+        let result = self.with_run_heartbeat(run_id, operation).await;
         self.finish_serializable_run(run_id, &result).await?;
-        lock_tx.commit().await?;
+        self.workflow_run_repo.release_run_lease(run_id).await?;
         result
     }
 
@@ -791,7 +803,7 @@ impl XingtuWorkflowService {
         request_id: Option<&str>,
     ) -> anyhow::Result<AuditResultSyncResult> {
         let _guard = self.write_lock.lock().await;
-        let (run_id, lock_tx) = self
+        let run_id = self
             .begin_exclusive_run(
                 "audit_result_sync",
                 activity_period_id,
@@ -799,13 +811,13 @@ impl XingtuWorkflowService {
                 request_id,
             )
             .await?;
-        let result = self
-            .tracked_optional_step(run_id, activity_period_id, "audit_result_sync", async {
+        let operation =
+            self.tracked_optional_step(run_id, activity_period_id, "audit_result_sync", async {
                 self.sync_audit_results_from_db(activity_period_id).await
-            })
-            .await;
+            });
+        let result = self.with_run_heartbeat(run_id, operation).await;
         self.finish_serializable_run(run_id, &result).await?;
-        lock_tx.commit().await?;
+        self.workflow_run_repo.release_run_lease(run_id).await?;
         result
     }
 
@@ -817,7 +829,7 @@ impl XingtuWorkflowService {
         request_id: Option<&str>,
     ) -> anyhow::Result<ManualRegistrationSyncResult> {
         let _guard = self.write_lock.lock().await;
-        let (run_id, lock_tx) = self
+        let run_id = self
             .begin_exclusive_run(
                 "manual_sync",
                 activity_period_id,
@@ -825,14 +837,14 @@ impl XingtuWorkflowService {
                 request_id,
             )
             .await?;
-        let result = self
-            .tracked_optional_step(run_id, activity_period_id, "manual_sync", async {
+        let operation =
+            self.tracked_optional_step(run_id, activity_period_id, "manual_sync", async {
                 self.sync_manual_registrations_inner(activity_period_id)
                     .await
-            })
-            .await;
+            });
+        let result = self.with_run_heartbeat(run_id, operation).await;
         self.finish_serializable_run(run_id, &result).await?;
-        lock_tx.commit().await?;
+        self.workflow_run_repo.release_run_lease(run_id).await?;
         result
     }
 
@@ -927,19 +939,46 @@ impl XingtuWorkflowService {
         result
     }
 
+    async fn with_run_heartbeat<T, F>(&self, run_id: i64, operation: F) -> anyhow::Result<T>
+    where
+        F: Future<Output = anyhow::Result<T>>,
+    {
+        tokio::pin!(operation);
+        let mut heartbeat =
+            tokio::time::interval(Duration::from_secs(WORKFLOW_LOCK_HEARTBEAT_SECONDS));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                outcome = &mut operation => break outcome,
+                _ = heartbeat.tick() => {
+                    match self.workflow_run_repo.heartbeat_run(run_id).await {
+                        Ok(true) => {}
+                        Ok(false) => break Err(anyhow!(
+                            "工作流运行租约或台账已失效，已停止当前工作流"
+                        )),
+                        Err(error) => break Err(error).context(
+                            "续租工作流运行心跳失败，已停止当前工作流以避免跨实例重复执行",
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     async fn begin_exclusive_run(
         &self,
         kind: &str,
         activity_period_id: Option<i64>,
         trigger_source: &str,
         request_id: Option<&str>,
-    ) -> anyhow::Result<(i64, Transaction<'static, Postgres>)> {
+    ) -> anyhow::Result<i64> {
         let run_id = self
             .workflow_run_repo
             .start_run(kind, activity_period_id, trigger_source, request_id)
             .await?;
-        let lock_tx = match self.workflow_run_repo.try_acquire_global_lock().await {
-            Ok(lock_tx) => lock_tx,
+        let acquired = match self.workflow_run_repo.try_acquire_run_lease(run_id).await {
+            Ok(acquired) => acquired,
             Err(error) => {
                 if let Err(finish_error) = self
                     .workflow_run_repo
@@ -956,13 +995,13 @@ impl XingtuWorkflowService {
                 return Err(error).context("获取跨实例工作流锁失败");
             }
         };
-        let Some(lock_tx) = lock_tx else {
+        if !acquired {
             self.workflow_run_repo
                 .finish_run_failure(run_id, "blocked", "workflow_busy", "已有写工作流正在运行")
                 .await?;
             return Err(WorkflowBusyError.into());
         };
-        Ok((run_id, lock_tx))
+        Ok(run_id)
     }
 
     async fn finish_serializable_run<T>(

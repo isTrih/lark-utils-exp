@@ -7,6 +7,7 @@ pub mod cache;
 pub mod data_protection;
 pub mod data_sync;
 pub mod error;
+pub mod login;
 pub mod query;
 pub mod scheduler;
 pub mod secret_store;
@@ -32,7 +33,7 @@ use salvo::http::{Method, mime};
 use salvo::oapi::{Info, OpenApi, swagger_ui::SwaggerUi};
 use salvo::prelude::*;
 use sqlx::Executor;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::{collections::HashMap, env, sync::Arc};
 use url::{Host, Url};
 
@@ -48,6 +49,8 @@ pub async fn build_app_state() -> anyhow::Result<Arc<AppState>> {
                 // 业务日期全部按北京时间计算；连接建立时固定数据库会话时区，
                 // 让 now()/CURRENT_DATE/timestamptz 展示不受数据库默认时区影响。
                 conn.execute("SET TIME ZONE 'Asia/Shanghai'").await?;
+                conn.execute("SET application_name = 'lark-utils-exp'")
+                    .await?;
                 Ok::<(), sqlx::Error>(())
             })
         })
@@ -58,6 +61,14 @@ pub async fn build_app_state() -> anyhow::Result<Arc<AppState>> {
         .run(&pool)
         .await
         .context("执行数据库 migration 失败")?;
+    let (expired_nonces, expired_auth_sessions) = startup_database_self_check(&pool).await?;
+    tracing::info!(
+        database_connections = pool.size(),
+        database_idle_connections = pool.num_idle(),
+        expired_nonces,
+        expired_auth_sessions,
+        "启动数据库自检通过：连接、事务、时区、关键表与应用临时状态正常"
+    );
 
     let lark_config = Config::from_env()?;
     let lark = LarkClient::new(lark_config.clone())?;
@@ -67,6 +78,7 @@ pub async fn build_app_state() -> anyhow::Result<Arc<AppState>> {
         lark_config,
         lark.clone(),
     );
+    let login = login::LoginService::from_env(pool.clone(), project_lark.clone())?;
     let activity_repo = XingtuActivityConfigRepository::new(pool.clone());
     let data_import_repo = XingtuDataImportRepository::new(pool.clone());
     let account_repo = XingtuAccountRepository::new(pool.clone(), SessionCipher::from_env()?);
@@ -101,7 +113,68 @@ pub async fn build_app_state() -> anyhow::Result<Arc<AppState>> {
         tracing::info!("已从 .env 注入调试星图登录态");
     }
 
-    Ok(Arc::new(AppState::new(pool, workflow, recovered_runs)))
+    Ok(Arc::new(AppState::new(
+        pool,
+        workflow,
+        login,
+        recovered_runs,
+    )))
+}
+
+/// 用一次真实提交事务验证数据库可读写，并安全清理已经明确失效的应用临时状态。
+///
+/// 不终止 PostgreSQL 中的其他会话或事务，避免滚动发布时误伤仍在工作的实例。
+async fn startup_database_self_check(pool: &PgPool) -> anyhow::Result<(u64, u64)> {
+    let mut tx = pool.begin().await.context("启动自检无法开启数据库事务")?;
+    let timezone: String = sqlx::query_scalar("SELECT current_setting('TimeZone')")
+        .fetch_one(&mut *tx)
+        .await
+        .context("启动自检无法读取数据库时区")?;
+    if timezone != "Asia/Shanghai" {
+        bail!("启动自检发现数据库连接时区异常：{timezone}");
+    }
+
+    let missing_tables: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT table_name
+        FROM unnest(ARRAY[
+            'xingtu_project',
+            'xingtu_activity_period',
+            'xingtu_activity_content_config',
+            'workflow_run',
+            'workflow_step',
+            'auth_session'
+        ]) AS required(table_name)
+        WHERE to_regclass(required.table_name) IS NULL
+        "#,
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .context("启动自检无法核验关键数据表")?;
+    if !missing_tables.is_empty() {
+        bail!("启动自检发现关键数据表缺失：{}", missing_tables.join(", "));
+    }
+
+    let expired_nonces =
+        sqlx::query("DELETE FROM data_sync_request_nonce WHERE expires_at <= now()")
+            .execute(&mut *tx)
+            .await
+            .context("启动自检清理过期请求 nonce 失败")?
+            .rows_affected();
+    let expired_auth_sessions = sqlx::query(
+        r#"
+        DELETE FROM auth_session
+        WHERE expires_at < now() - interval '7 days'
+           OR (revoked_at IS NOT NULL AND revoked_at < now() - interval '7 days')
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .context("启动自检清理过期登录会话失败")?
+    .rows_affected();
+
+    tx.commit().await.context("启动自检无法提交数据库事务")?;
+    Ok((expired_nonces, expired_auth_sessions))
 }
 
 /// 构建 Salvo 路由。

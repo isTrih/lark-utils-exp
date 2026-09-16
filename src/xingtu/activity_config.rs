@@ -340,9 +340,9 @@ impl XingtuActivityConfigRepository {
         Ok(contents)
     }
 
-    /// 查询一次自动工作流需要依次处理的活动期次。
+    /// 查询一次自动工作流需要处理的活动期次。
     ///
-    /// 返回顺序就是执行顺序。这里只选择启用、存在同步内容且仍在追踪窗口内的期次；
+    /// 这里只选择启用、存在同步内容且仍在追踪窗口内的期次；调用方会受控并行执行。
     /// 传入 `activity_period_id` 时只返回指定期次。
     pub async fn list_workflow_activity_scopes(
         &self,
@@ -1463,7 +1463,7 @@ fn default_manual_auto_approve_result() -> String {
 
 /// 判断一次星图拉取是否落在活动追踪窗口内。
 ///
-/// `tracking_end_date` 当天 23:59 是最后一次自动更新窗口，次日不再拉取。
+/// `tracking_end_date` 当天 23:59:59 是最后一次自动更新窗口，次日不再拉取。
 fn tracking_window_includes(
     run_at: DateTime<Utc>,
     tracking_start_date: Option<NaiveDate>,

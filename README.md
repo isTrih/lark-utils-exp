@@ -110,6 +110,9 @@ cargo run --bin server
 | 变量 | 必需性 | 说明 |
 | --- | --- | --- |
 | `MUTATION_API_TOKEN` | 强烈推荐 | 管理和写接口共享 Bearer Token。未配置时相关接口默认拒绝访问。 |
+| `AUTH_JWT_SECRET` | 启用飞书登录时必需 | 至少 32 字节，用于签发 7 天 JWT 及 10 分钟登录 state；不得与其他 Token 共用。 |
+| `AUTH_REDIRECT_URIS` | 启用飞书登录时必需 | 允许的完整 OAuth 回调地址 JSON 数组或逗号列表，必须与请求精确匹配。 |
+| `INTERNAL_API_TOKEN` | 可选 | 可信内部应用只读访问全部 `/api/v1/queries` 的独立 Bearer Token，不可管理项目。 |
 | `ADMIN_API_TOKEN` | 兼容项 | 仅在未配置 `MUTATION_API_TOKEN` 时作为旧部署回退。 |
 | `XINGTU_SESSION_UPLOAD_TOKEN` | 使用插件时必需 | 插件共享上传 Token，只允许上传登录态。 |
 | `XINGTU_SESSION_ENCRYPTION_KEY` | 必需 | 标准 Base64，解码后恰好 32 字节；用于 AES-256-GCM 加密数据库中的星图登录态。 |
@@ -181,11 +184,11 @@ CORS_DOMAIN=example.com,*.example.com
 
 内置调度全部按 `Asia/Shanghai`：
 
-- `periodic`：12:00、18:00；
+- `periodic`：13:00、18:00；
 - `morning`：09:00；
-- `night`：23:59。
+- `night`：23:59:59。
 
-`tracking_end_date` 当天北京时间 23:59 执行最后一次更新，次日不再自动拉取。
+`tracking_end_date` 当天北京时间 23:59:59 执行最后一次更新，次日不再自动拉取。若固定时点已有写工作流运行，本次定时触发不会排队补跑，以免多个过期任务连续执行。
 
 ## API 与数据安全
 

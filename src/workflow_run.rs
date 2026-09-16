@@ -7,6 +7,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::time::Duration;
 
 const WORKFLOW_ADVISORY_LOCK_NAME: &str = "lark-utils-exp:workflow-write-lock:v1";
+const WORKFLOW_LEASE_SECONDS: i32 = 60;
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct WorkflowRunRecord {
@@ -16,6 +17,7 @@ pub struct WorkflowRunRecord {
     pub trigger_source: String,
     pub status: String,
     pub started_at: DateTime<Utc>,
+    pub heartbeat_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub summary: Value,
     pub error_code: Option<String>,
@@ -70,6 +72,77 @@ impl WorkflowRunRepository {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.try_get("workflow_run_id")?)
+    }
+
+    /// 更新仍在运行的工作流心跳。
+    ///
+    /// 心跳使用连接池中的独立连接写入，不依赖 advisory lock 所在连接，兼容数据库代理
+    /// 回收长事务连接的情况。
+    pub async fn heartbeat_run(&self, run_id: i64) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let renewed: bool = sqlx::query_scalar(
+            r#"
+            UPDATE workflow_execution_lease
+            SET lease_until = now() + make_interval(secs => $2), updated_at = now()
+            WHERE singleton = true AND workflow_run_id = $1
+            RETURNING true
+            "#,
+        )
+        .bind(run_id)
+        .bind(WORKFLOW_LEASE_SECONDS)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        if !renewed {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let alive: bool = sqlx::query_scalar(
+            r#"
+            UPDATE workflow_run
+            SET heartbeat_at = now()
+            WHERE workflow_run_id = $1 AND status = 'running'
+            RETURNING true
+            "#,
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        tx.commit().await?;
+        Ok(alive)
+    }
+
+    pub async fn try_acquire_run_lease(&self, run_id: i64) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar(
+            r#"
+            UPDATE workflow_execution_lease
+            SET workflow_run_id = $1,
+                lease_until = now() + make_interval(secs => $2),
+                updated_at = now()
+            WHERE singleton = true AND lease_until <= now()
+            RETURNING true
+            "#,
+        )
+        .bind(run_id)
+        .bind(WORKFLOW_LEASE_SECONDS)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false))
+    }
+
+    pub async fn release_run_lease(&self, run_id: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE workflow_execution_lease
+            SET workflow_run_id = NULL, lease_until = now(), updated_at = now()
+            WHERE singleton = true AND workflow_run_id = $1
+            "#,
+        )
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// 事务级 advisory lock 会在 commit/rollback 或连接异常时自动释放。
@@ -248,7 +321,7 @@ impl WorkflowRunRepository {
         let rows = sqlx::query(
             r#"
             SELECT workflow_run_id, workflow_kind, scope_activity_period_id, trigger_source,
-                status, started_at, finished_at, summary, error_code, error_message, request_id
+                status, started_at, heartbeat_at, finished_at, summary, error_code, error_message, request_id
             FROM workflow_run
             ORDER BY started_at DESC, workflow_run_id DESC
             LIMIT $1 OFFSET $2
@@ -362,10 +435,10 @@ impl WorkflowRunRepository {
         Ok(())
     }
 
-    /// 仅在没有其他实例持有全局工作流锁时回收孤儿台账。
+    /// 仅回收心跳与跨实例租约都已过期的孤儿台账。
     ///
-    /// 最小存活时间用于规避“创建运行记录”和“取得全局锁”之间的极短竞态；事务级锁则
-    /// 保证不会把另一台仍在正常执行的实例误判成异常退出。
+    /// 最小心跳超时用于规避暂时性数据库抖动；短事务租约避免依赖数据库代理长期
+    /// 保持某条连接，只要执行实例仍持续续租，就不会被误判为异常退出。
     pub async fn reconcile_orphaned_runs_if_idle(
         &self,
         minimum_age: Duration,
@@ -376,7 +449,7 @@ impl WorkflowRunRepository {
             SELECT EXISTS (
                 SELECT 1 FROM workflow_run
                 WHERE status = 'running'
-                  AND started_at < now() - make_interval(secs => $1)
+                  AND heartbeat_at < now() - make_interval(secs => $1)
             )
             "#,
         )
@@ -386,9 +459,16 @@ impl WorkflowRunRepository {
         if !has_candidate {
             return Ok(0);
         }
-        let Some(mut tx) = self.try_acquire_global_lock().await? else {
-            return Ok(0);
-        };
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            UPDATE workflow_execution_lease
+            SET workflow_run_id = NULL, lease_until = now(), updated_at = now()
+            WHERE singleton = true AND lease_until <= now()
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             r#"
             UPDATE workflow_step
@@ -398,7 +478,13 @@ impl WorkflowRunRepository {
                 SELECT workflow_run_id
                 FROM workflow_run
                 WHERE status = 'running'
-                  AND started_at < now() - make_interval(secs => $1)
+                  AND heartbeat_at < now() - make_interval(secs => $1)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM workflow_execution_lease lease
+                      WHERE lease.singleton = true
+                        AND lease.workflow_run_id = workflow_run.workflow_run_id
+                        AND lease.lease_until > now()
+                  )
             )
             "#,
         )
@@ -411,7 +497,13 @@ impl WorkflowRunRepository {
             SET status = 'failed', finished_at = now(), error_code = 'stale_run',
                 error_message = COALESCE(error_message, '工作流进程失联，运行台账由孤儿恢复标记失败')
             WHERE status = 'running'
-                AND started_at < now() - make_interval(secs => $1)
+                AND heartbeat_at < now() - make_interval(secs => $1)
+                AND NOT EXISTS (
+                    SELECT 1 FROM workflow_execution_lease lease
+                    WHERE lease.singleton = true
+                      AND lease.workflow_run_id = workflow_run.workflow_run_id
+                      AND lease.lease_until > now()
+                )
             "#,
         )
         .bind(seconds)
@@ -440,6 +532,7 @@ fn run_from_row(row: sqlx::postgres::PgRow) -> anyhow::Result<WorkflowRunRecord>
         trigger_source: row.try_get("trigger_source")?,
         status: row.try_get("status")?,
         started_at: row.try_get("started_at")?,
+        heartbeat_at: row.try_get("heartbeat_at")?,
         finished_at: row.try_get("finished_at")?,
         summary: row.try_get("summary")?,
         error_code: row.try_get("error_code")?,

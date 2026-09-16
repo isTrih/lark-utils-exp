@@ -40,7 +40,7 @@ async function readSavedConfig(): Promise<Record<string, unknown>> {
 
 async function loadConfig(): Promise<void> {
   try {
-    const response = await fetch(apiPath("/api/v1/queries/projects"), {
+    const response = await fetch(apiPath("/api/data-sync/projects"), {
       headers: { Accept: "application/json" },
     });
     if (!response.ok) {

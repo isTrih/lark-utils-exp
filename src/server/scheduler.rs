@@ -6,11 +6,11 @@ use std::{sync::Arc, time::Duration};
 use tokio::time::{Instant, sleep_until};
 
 const PERIODIC_TIMES: [NaiveTime; 2] = [
-    NaiveTime::from_hms_opt(12, 0, 0).expect("valid time"),
+    NaiveTime::from_hms_opt(13, 0, 0).expect("valid time"),
     NaiveTime::from_hms_opt(18, 0, 0).expect("valid time"),
 ];
 const MORNING_TIME: NaiveTime = NaiveTime::from_hms_opt(9, 0, 0).expect("valid time");
-const NIGHT_TIME: NaiveTime = NaiveTime::from_hms_opt(23, 59, 0).expect("valid time");
+const NIGHT_TIME: NaiveTime = NaiveTime::from_hms_opt(23, 59, 59).expect("valid time");
 const LOGIN_CHECK_TIME: NaiveTime = NaiveTime::from_hms_opt(0, 30, 0).expect("valid time");
 const ORPHAN_RECOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const ORPHAN_MINIMUM_AGE: Duration = Duration::from_secs(5 * 60);
@@ -106,23 +106,27 @@ async fn run_orphan_recovery_loop(state: Arc<AppState>, mut catch_up_required: b
 async fn run_daily_workflow_loop(state: Arc<AppState>, kind: WorkflowKind, time: NaiveTime) {
     loop {
         sleep_until(next_daily_instant(time)).await;
-        let result = state
-            .workflow
-            .run_workflow(kind, None, "scheduler", None)
-            .await;
+        let result = state.workflow.try_run_scheduled_workflow(kind).await;
         // 后续步骤失败前可能已有数据落库，不能让 24 小时查询缓存继续返回旧数据。
         if let Err(error) = state.query_cache.invalidate_all_shared().await {
             tracing::error!(error = ?error, "跨实例失效查询缓存失败");
         }
         match result {
-            Ok(result) if result.failed_activities.is_empty() => {
+            Ok(None) => {
+                tracing::warn!(
+                    kind = ?kind,
+                    scheduled_time = %time,
+                    "定时触发时已有写工作流运行，本次不排队并安全跳过"
+                );
+            }
+            Ok(Some(result)) if result.failed_activities.is_empty() => {
                 tracing::info!(
                     kind = ?kind,
                     processed_activity_period_ids = ?result.processed_activity_period_ids,
                     "定时工作流全部项目执行成功"
                 );
             }
-            Ok(result) => {
+            Ok(Some(result)) => {
                 tracing::error!(
                     kind = ?kind,
                     processed_activity_period_ids = ?result.processed_activity_period_ids,
@@ -191,11 +195,11 @@ mod tests {
         assert_eq!(
             PERIODIC_TIMES,
             [
-                NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+                NaiveTime::from_hms_opt(13, 0, 0).unwrap(),
                 NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
             ]
         );
         assert_eq!(MORNING_TIME, NaiveTime::from_hms_opt(9, 0, 0).unwrap());
-        assert_eq!(NIGHT_TIME, NaiveTime::from_hms_opt(23, 59, 0).unwrap());
+        assert_eq!(NIGHT_TIME, NaiveTime::from_hms_opt(23, 59, 59).unwrap());
     }
 }

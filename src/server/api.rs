@@ -63,10 +63,11 @@ pub mod health {
 pub fn routes() -> Router {
     Router::with_path("api/v1")
         .hoop(crate::server::error::request_context)
+        .push(crate::server::login::routes())
         .push(crate::server::admin::routes())
         .push(
             Router::with_path("projects/{activity_period_id}/report/send")
-                .hoop(crate::server::auth::require_mutation_token)
+                .hoop(crate::server::auth::require_management_access)
                 .post(send_project_report),
         )
         .push(
@@ -78,18 +79,18 @@ pub fn routes() -> Router {
                 )
                 .push(
                     Router::with_path("sessions/{account_id}/check")
-                        .hoop(crate::server::auth::require_mutation_token)
+                        .hoop(crate::server::auth::require_default_admin)
                         .get(check_xingtu_session),
                 )
                 .push(
                     Router::with_path("sessions/check-all")
-                        .hoop(crate::server::auth::require_mutation_token)
+                        .hoop(crate::server::auth::require_default_admin)
                         .post(check_all_xingtu_sessions),
                 ),
         )
         .push(
             Router::with_path("workflows")
-                .hoop(crate::server::auth::require_mutation_token)
+                .hoop(crate::server::auth::require_management_access)
                 .push(Router::with_path("audit/run").post(run_audit_notice))
                 .push(Router::with_path("audit-results/sync").post(sync_audit_results))
                 .push(Router::with_path("manual-sync/run").post(run_manual_sync))
@@ -98,6 +99,7 @@ pub fn routes() -> Router {
         )
         .push(
             Router::with_path("queries")
+                .hoop(crate::server::auth::require_data_access)
                 .hoop(Timeout::new(std::time::Duration::from_secs(30)))
                 .push(Router::with_path("projects").get(list_current_projects))
                 .push(Router::with_path("periods").get(list_periods))
@@ -133,11 +135,14 @@ async fn list_current_projects(depot: &mut Depot) -> ApiResult<Vec<query::Curren
     let state = state_from_depot(depot)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
-    let data = cache
+    let mut data = cache
         .get_or_try_insert("current-projects".to_string(), || async move {
             query::list_current_projects(&pool).await
         })
         .await?;
+    if let Some(project_ids) = crate::server::auth::actor_from_depot(depot)?.visible_project_ids() {
+        data.retain(|item| project_ids.contains(&item.project_id));
+    }
     Ok(Json(data))
 }
 
@@ -162,6 +167,7 @@ async fn send_project_report(
     }
 
     let state = state_from_depot(depot)?;
+    crate::server::auth::require_period_manage(depot, &state.pool, path.activity_period_id).await?;
     let context = project_report::load_project_report_context(&state.pool, path.activity_period_id)
         .await?
         .ok_or_else(|| {
@@ -502,6 +508,7 @@ async fn run_workflow(
     let state = state_from_depot(depot)?;
     let kind = parse_workflow_kind(&path.kind)?;
     let activity_period_id = workflow_activity_period_id(body.into_inner())?;
+    authorize_workflow_scope(depot, &state.pool, activity_period_id).await?;
     let request_id = request_id_from_depot(depot);
     let result = state
         .run_workflow_independent(
@@ -525,6 +532,7 @@ async fn run_audit_notice(
 ) -> ApiResult<AuditNoticeRunResponse> {
     let state = state_from_depot(depot)?;
     let activity_period_id = workflow_activity_period_id(body.into_inner())?;
+    authorize_workflow_scope(depot, &state.pool, activity_period_id).await?;
     let request_id = request_id_from_depot(depot);
     let result = state
         .workflow
@@ -544,6 +552,7 @@ async fn sync_audit_results(
 ) -> ApiResult<AuditResultSyncResponse> {
     let state = state_from_depot(depot)?;
     let activity_period_id = workflow_activity_period_id(body.into_inner())?;
+    authorize_workflow_scope(depot, &state.pool, activity_period_id).await?;
     let request_id = request_id_from_depot(depot);
     let result = state
         .workflow
@@ -564,6 +573,7 @@ async fn run_manual_sync(
 ) -> ApiResult<ManualRegistrationSyncResponse> {
     let state = state_from_depot(depot)?;
     let activity_period_id = workflow_activity_period_id(body.into_inner())?;
+    authorize_workflow_scope(depot, &state.pool, activity_period_id).await?;
     let request_id = request_id_from_depot(depot);
     let result = state
         .workflow
@@ -588,6 +598,7 @@ async fn import_pending_sources(
         activity_period_id: None,
     });
     let activity_period_id = validate_activity_period_id(body.activity_period_id)?;
+    authorize_workflow_scope(depot, &state.pool, activity_period_id).await?;
     let request_id = request_id_from_depot(depot);
     let imported = state
         .workflow
@@ -622,16 +633,36 @@ fn validate_activity_period_id(activity_period_id: Option<i64>) -> Result<Option
     Ok(activity_period_id)
 }
 
+async fn authorize_workflow_scope(
+    depot: &Depot,
+    pool: &sqlx::PgPool,
+    activity_period_id: Option<i64>,
+) -> Result<(), ApiError> {
+    match activity_period_id {
+        Some(activity_period_id) => {
+            crate::server::auth::require_period_manage(depot, pool, activity_period_id).await?;
+            Ok(())
+        }
+        None if crate::server::auth::actor_from_depot(depot)?.is_default_admin() => Ok(()),
+        None => Err(ApiError::forbidden(
+            "非默认应用执行工作流时必须指定已获配置权限的 activity_period_id",
+        )),
+    }
+}
+
 #[endpoint(tags("queries"), summary = "查询启用中的活动期次配置")]
 async fn list_periods(depot: &mut Depot) -> ApiResult<Vec<query::ActivityPeriodDto>> {
     let state = state_from_depot(depot)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
-    let data = cache
+    let mut data = cache
         .get_or_try_insert("periods".to_string(), || async move {
             query::list_activity_periods(&pool).await
         })
         .await?;
+    if let Some(project_ids) = crate::server::auth::actor_from_depot(depot)?.visible_project_ids() {
+        data.retain(|item| project_ids.contains(&item.project_id));
+    }
     Ok(Json(data))
 }
 
@@ -640,11 +671,15 @@ async fn list_contents(depot: &mut Depot) -> ApiResult<Vec<query::ContentConfigD
     let state = state_from_depot(depot)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
-    let data = cache
+    let mut data = cache
         .get_or_try_insert("contents".to_string(), || async move {
             query::list_content_configs(&pool).await
         })
         .await?;
+    if let Some(project_ids) = crate::server::auth::actor_from_depot(depot)?.visible_project_ids() {
+        let period_ids = visible_period_ids(&state.pool, &project_ids).await?;
+        data.retain(|item| period_ids.contains(&item.activity_period_id));
+    }
     Ok(Json(data))
 }
 
@@ -653,6 +688,7 @@ async fn list_feishu_sources(
     page: PageQuery,
     depot: &mut Depot,
 ) -> ApiResult<Vec<query::FeishuSourceDto>> {
+    crate::server::auth::require_global_query(depot)?;
     let state = state_from_depot(depot)?;
     let key = format!("feishu-sources:{}:{}", page.limit(), page.offset());
     let cache = state.query_cache.clone();
@@ -667,6 +703,7 @@ async fn list_feishu_sources(
 
 #[endpoint(tags("queries"), summary = "查询飞书来源待导入/失败数量")]
 async fn pending_summary(depot: &mut Depot) -> ApiResult<query::PendingSummaryDto> {
+    crate::server::auth::require_global_query(depot)?;
     let state = state_from_depot(depot)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
@@ -680,6 +717,7 @@ async fn pending_summary(depot: &mut Depot) -> ApiResult<query::PendingSummaryDt
 
 #[endpoint(tags("queries"), summary = "查询视频/图文基础内容数据")]
 async fn list_videos(page: PageQuery, depot: &mut Depot) -> ApiResult<Vec<query::VideoContentDto>> {
+    crate::server::auth::require_global_query(depot)?;
     let state = state_from_depot(depot)?;
     let key = format!("videos:{}:{}", page.limit(), page.offset());
     let cache = state.query_cache.clone();
@@ -697,6 +735,7 @@ async fn list_video_metrics(
     page: PageQuery,
     depot: &mut Depot,
 ) -> ApiResult<Vec<query::VideoMetricDto>> {
+    crate::server::auth::require_global_query(depot)?;
     let state = state_from_depot(depot)?;
     let key = format!("video-metrics:{}:{}", page.limit(), page.offset());
     let cache = state.query_cache.clone();
@@ -718,6 +757,7 @@ async fn list_video_trace_metrics(
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let state = state_from_depot(depot)?;
+    authorize_content_scope(depot, &state.pool, filters.content_config_id).await?;
     let key = cache_key("video-trace-metrics", &filters)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
@@ -734,6 +774,7 @@ async fn list_live_sessions(
     page: PageQuery,
     depot: &mut Depot,
 ) -> ApiResult<Vec<query::LiveSessionDto>> {
+    crate::server::auth::require_global_query(depot)?;
     let state = state_from_depot(depot)?;
     let key = format!("live-sessions:{}:{}", page.limit(), page.offset());
     let cache = state.query_cache.clone();
@@ -755,6 +796,7 @@ async fn list_videos_with_metrics(
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let state = state_from_depot(depot)?;
+    authorize_content_scope(depot, &state.pool, filters.content_config_id).await?;
     let key = cache_key("videos-with-metrics", &filters)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
@@ -775,6 +817,7 @@ async fn video_summary(
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let state = state_from_depot(depot)?;
+    authorize_content_scope(depot, &state.pool, filters.content_config_id).await?;
     let key = cache_key("video-summary", &filters)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
@@ -796,6 +839,7 @@ async fn live_summary(
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let state = state_from_depot(depot)?;
+    authorize_content_scope(depot, &state.pool, filters.content_config_id).await?;
     let key = cache_key("live-summary", &filters)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
@@ -817,6 +861,7 @@ async fn top_video_growth(
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let state = state_from_depot(depot)?;
+    authorize_content_scope(depot, &state.pool, filters.content_config_id).await?;
     let key = cache_key("top-video-growth", &filters)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
@@ -837,6 +882,13 @@ async fn video_label_summary(
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let state = state_from_depot(depot)?;
+    authorize_period_or_content_scope(
+        depot,
+        &state.pool,
+        filters.activity_period_id,
+        filters.content_config_id,
+    )
+    .await?;
     let key = cache_key("video-label-summary", &filters)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
@@ -864,6 +916,7 @@ async fn search_audit_extra(
     let state = state_from_depot(depot)?;
     let project_id = filters.project_id;
     let activity_period_id = filters.activity_period_id;
+    crate::server::auth::require_project_view(depot, project_id)?;
     let data = if filters.contains_sensitive_condition() {
         crate::server::audit_extra_query::search(&state.pool, filters).await?
     } else {
@@ -900,6 +953,7 @@ async fn audit_extra_live_pv_below_weighted_acu(
     let state = state_from_depot(depot)?;
     let project_id = filters.project_id;
     let activity_period_id = filters.activity_period_id;
+    crate::server::auth::require_project_view(depot, project_id)?;
     let data = if filters.contains_sensitive_condition() {
         crate::server::audit_extra_query::total_live_pv_below_weighted_acu(&state.pool, filters)
             .await?
@@ -938,6 +992,7 @@ async fn audit_extra_video_play_below_author_total(
     let state = state_from_depot(depot)?;
     let project_id = filters.project_id;
     let activity_period_id = filters.activity_period_id;
+    crate::server::auth::require_project_view(depot, project_id)?;
     let data = if filters.contains_sensitive_condition() {
         crate::server::audit_extra_query::total_video_play_below_author_total(&state.pool, filters)
             .await?
@@ -974,6 +1029,13 @@ async fn list_videos_v2(
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let state = state_from_depot(depot)?;
+    authorize_period_or_content_scope(
+        depot,
+        &state.pool,
+        filters.activity_period_id,
+        filters.content_config_id,
+    )
+    .await?;
     let key = cache_key("v2-videos", &filters)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
@@ -997,6 +1059,13 @@ async fn list_live_sessions_v2(
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let state = state_from_depot(depot)?;
+    authorize_period_or_content_scope(
+        depot,
+        &state.pool,
+        filters.activity_period_id,
+        filters.content_config_id,
+    )
+    .await?;
     let key = cache_key("v2-live-sessions", &filters)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
@@ -1020,6 +1089,13 @@ async fn list_feishu_sources_v2(
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let state = state_from_depot(depot)?;
+    authorize_period_or_content_scope(
+        depot,
+        &state.pool,
+        filters.activity_period_id,
+        filters.content_config_id,
+    )
+    .await?;
     let key = cache_key("v2-feishu-sources", &filters)?;
     let cache = state.query_cache.clone();
     let pool = state.pool.clone();
@@ -1034,6 +1110,59 @@ async fn list_feishu_sources_v2(
 fn cache_key<T: Serialize>(prefix: &str, query: &T) -> Result<String, ApiError> {
     let encoded = serde_json::to_string(query).map_err(ApiError::internal)?;
     Ok(format!("{prefix}:{encoded}"))
+}
+
+async fn visible_period_ids(
+    pool: &sqlx::PgPool,
+    project_ids: &[i64],
+) -> Result<std::collections::HashSet<i64>, ApiError> {
+    if project_ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let ids = sqlx::query_scalar::<_, i64>(
+        "SELECT activity_period_id FROM xingtu_activity_period WHERE project_id = ANY($1)",
+    )
+    .bind(project_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids.into_iter().collect())
+}
+
+async fn authorize_content_scope(
+    depot: &Depot,
+    pool: &sqlx::PgPool,
+    content_config_id: Option<i64>,
+) -> Result<(), ApiError> {
+    match content_config_id {
+        Some(id) if id > 0 => {
+            crate::server::auth::require_content_view(depot, pool, id).await?;
+            Ok(())
+        }
+        Some(_) => Err(ApiError::bad_request("content_config_id 必须大于 0")),
+        None => crate::server::auth::require_global_query(depot),
+    }
+}
+
+async fn authorize_period_or_content_scope(
+    depot: &Depot,
+    pool: &sqlx::PgPool,
+    activity_period_id: Option<i64>,
+    content_config_id: Option<i64>,
+) -> Result<(), ApiError> {
+    if let Some(id) = activity_period_id {
+        if id <= 0 {
+            return Err(ApiError::bad_request("activity_period_id 必须大于 0"));
+        }
+        crate::server::auth::require_period_view(depot, pool, id).await?;
+    } else if let Some(id) = content_config_id {
+        if id <= 0 {
+            return Err(ApiError::bad_request("content_config_id 必须大于 0"));
+        }
+        crate::server::auth::require_content_view(depot, pool, id).await?;
+    } else {
+        crate::server::auth::require_global_query(depot)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1062,12 +1191,39 @@ mod tests {
         Service::new(Router::new().post(optional_json_probe))
     }
 
+    fn query_validation_test_service() -> Service {
+        Service::new(
+            Router::with_path("api/v1/queries")
+                .push(Router::with_path("v2/audit-extra/search").post(search_audit_extra))
+                .push(
+                    Router::with_path("v2/audit-extra/live-pv/weighted-acu-below")
+                        .post(audit_extra_live_pv_below_weighted_acu),
+                )
+                .push(
+                    Router::with_path("v2/audit-extra/video-play/author-total-below")
+                        .post(audit_extra_video_play_below_author_total),
+                )
+                .push(Router::with_path("v2/videos").get(list_videos_v2)),
+        )
+    }
+
     #[test]
     fn workflow_scope_accepts_only_positive_activity_period_ids() {
         assert_eq!(validate_activity_period_id(None).unwrap(), None);
         assert_eq!(validate_activity_period_id(Some(2)).unwrap(), Some(2));
         assert!(validate_activity_period_id(Some(0)).is_err());
         assert!(validate_activity_period_id(Some(-1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn dashboard_queries_require_authentication() {
+        let service = Service::new(routes());
+        let mut response = TestClient::get("http://127.0.0.1/api/v1/queries/projects")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+        let body = response.take_json::<Value>().await.unwrap();
+        assert_eq!(body["code"], "unauthorized");
     }
 
     #[test]
@@ -1122,7 +1278,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_extra_search_rejects_missing_conditions_before_database_access() {
-        let service = Service::new(routes());
+        let service = query_validation_test_service();
         let mut response =
             TestClient::post("http://127.0.0.1/api/v1/queries/v2/audit-extra/search")
                 .json(&json!({
@@ -1141,7 +1297,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_extra_threshold_queries_validate_limits_before_database_access() {
-        let service = Service::new(routes());
+        let service = query_validation_test_service();
         let cases = [
             (
                 "http://127.0.0.1/api/v1/queries/v2/audit-extra/live-pv/weighted-acu-below",
@@ -1174,7 +1330,7 @@ mod tests {
 
     #[tokio::test]
     async fn v2_video_query_rejects_reversed_beijing_date_range() {
-        let service = Service::new(routes());
+        let service = query_validation_test_service();
         let mut response = TestClient::get(
             "http://127.0.0.1/api/v1/queries/v2/videos?date_from=2026-08-09&date_to=2026-08-03",
         )

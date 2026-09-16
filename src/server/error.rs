@@ -52,6 +52,15 @@ impl ApiError {
         }
     }
 
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+            message: message.into(),
+            internal_detail: None,
+        }
+    }
+
     pub fn service_unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -206,6 +215,11 @@ impl EndpointOutRegister for ApiError {
         operation.responses.insert(
             "401",
             salvo::oapi::Response::new("Bearer token 无效")
+                .add_content("application/json", schema.clone()),
+        );
+        operation.responses.insert(
+            "403",
+            salvo::oapi::Response::new("当前登录身份没有访问权限")
                 .add_content("application/json", schema.clone()),
         );
         operation.responses.insert(

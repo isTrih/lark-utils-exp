@@ -3,8 +3,8 @@ import { apiPath } from "./urls";
 
 describe("apiPath", () => {
   test("keeps root API paths unchanged", () => {
-    expect(apiPath("/api/v1/queries/projects")).toBe(
-      "/api/v1/queries/projects",
+    expect(apiPath("/api/data-sync/projects")).toBe(
+      "/api/data-sync/projects",
     );
   });
 

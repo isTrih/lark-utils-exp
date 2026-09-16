@@ -1,4 +1,5 @@
 use crate::server::cache::QueryCache;
+use crate::server::login::LoginService;
 use crate::workflow::{WorkflowKind, WorkflowRunResult, XingtuWorkflowService};
 use anyhow::Context;
 use sqlx::PgPool;
@@ -10,6 +11,7 @@ pub struct AppState {
     pub pool: PgPool,
     pub workflow: XingtuWorkflowService,
     pub query_cache: QueryCache,
+    pub login: LoginService,
     pub recovered_workflow_runs: u64,
 }
 
@@ -17,12 +19,14 @@ impl AppState {
     pub fn new(
         pool: PgPool,
         workflow: XingtuWorkflowService,
+        login: LoginService,
         recovered_workflow_runs: u64,
     ) -> Self {
         Self {
             query_cache: QueryCache::new(pool.clone()),
             pool,
             workflow,
+            login,
             recovered_workflow_runs,
         }
     }

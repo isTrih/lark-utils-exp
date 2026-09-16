@@ -27,8 +27,42 @@ https://api.example.com
 ```
 
 服务会接受或生成 `X-Request-ID`，在响应头和错误体中回传。内部错误只向客户端返回
-`internal_error + 服务内部错误`，完整错误链仅进入结构化日志。除健康检查、文档、只读查询和
-飞书连接器外，写接口统一要求 `Authorization: Bearer <MUTATION_API_TOKEN>`；未配置时兼容
+`internal_error + 服务内部错误`，完整错误链仅进入结构化日志。除健康检查、文档、飞书登录入口
+和独立飞书连接器外，数据查询与管理接口均要求
+`Authorization: Bearer <JWT>`。默认飞书应用登录可查看并管理全部项目；非默认应用登录只可
+访问默认管理员授予的项目，并按 `can_manage` 决定是否可编辑项目和期次。为兼容内部运维，
+`MUTATION_API_TOKEN` 仍等价于默认管理员；`INTERNAL_API_TOKEN` 只允许读取全部查询接口。
+
+### 飞书登录
+
+1. `GET /api/v1/auth/apps` 获取可选登录应用；`feishu_app_id=null` 表示环境变量中的默认应用。
+2. `POST /api/v1/auth/authorize` 传入 `feishu_app_id` 与白名单中的完整 `redirect_uri`，得到
+   `authorization_url` 后跳转飞书。
+3. 飞书回调后，将查询参数中的 `code`、`state` 传给 `POST /api/v1/auth/callback`。成功响应
+   包含有效期 7 天的 JWT、头像、union ID、open ID、用户名及项目权限。
+4. `GET /api/v1/auth/me` 校验并返回当前会话；`POST /api/v1/auth/logout` 立即撤销 JWT。
+
+服务端仅使用飞书 `user_access_token` 获取一次基础用户信息，不保存该 Token，也不申请文档、
+通讯录或消息权限。飞书应用需要将看板 `/login` 完整地址加入重定向 URL 白名单。
+
+默认管理员通过以下接口完整替换非默认应用的项目授权：
+
+```http
+PUT /api/v1/admin/feishu/apps/{feishu_app_id}/project-access
+Authorization: Bearer <默认应用 JWT 或 MUTATION_API_TOKEN>
+Content-Type: application/json
+
+{
+  "projects": [
+    { "project_id": 1, "can_view": true, "can_manage": true },
+    { "project_id": 2, "can_view": true, "can_manage": false }
+  ]
+}
+```
+
+`can_manage=true` 必须同时 `can_view=true`。权限每次请求实时读取，修改后对已有 JWT 立即生效。
+
+飞书连接器外，旧写接口曾统一要求 `Authorization: Bearer <MUTATION_API_TOKEN>`；未配置时兼容
 回退到 `ADMIN_API_TOKEN`。唯一例外是 `POST /api/v1/xingtu/sessions`：内部浏览器插件可使用
 共享的 `XINGTU_SESSION_UPLOAD_TOKEN`，管理员 Token 也继续兼容。上传专用 Token 不能访问
 工作流、账号检查或管理接口。生产环境必须配置长随机 Token。
@@ -82,10 +116,11 @@ https://api.example.com
 | --- | --- | --- |
 | `GET` | `/meta.json` | 返回数据同步插件元信息、配置页和数据接口地址 |
 | `GET` | `/data-sync/config` | 项目选择配置页 |
+| `GET` | `/api/data-sync/projects` | 配置页专用的启用期次最小清单，不包含看板指标或管理配置 |
 | `POST` | `/api/data-sync/table-meta` | 返回日报表名和 15 个字段 |
 | `POST` | `/api/data-sync/records` | 按飞书 `maxPageSize/pageToken` 返回日报记录 |
 
-配置页读取 `GET /api/v1/queries/projects`，展示当前全部启用项目。用户选择后，配置页通过飞书官方 SDK 保存：
+配置页读取专用的 `GET /api/data-sync/projects`，展示当前全部启用项目；看板使用的 `/api/v1/queries/**` 仍必须登录。用户选择后，配置页通过飞书官方 SDK 保存：
 
 ```json
 {
@@ -967,7 +1002,7 @@ curl "https://api.example.com/api/v1/queries/periods"
 ```
 
 `tracking_end_date` 表示业务追踪的最后日期。最后一次自动更新发生在结束日北京时间
-`23:59`，次日起不再拉取星图，也不会再读取旧 Sheet、更新业务多维表或发送自动审核通知。
+`23:59:59`，次日起不再拉取星图，也不会再读取旧 Sheet、更新业务多维表或发送自动审核通知。
 
 ### `GET /api/v1/queries/contents`
 
@@ -1124,7 +1159,7 @@ curl "https://api.example.com/api/v1/queries/video-metrics?limit=50&offset=0"
 
 ### `GET /api/v1/queries/video-trace-metrics`
 
-查询视频每次星图追踪导入的快照指标。这个接口读取历史导入表，适合查看 09:00、12:00、18:00、23:59 固定拉取和手动触发留下的快照数据。
+查询视频每次星图追踪导入的快照指标。这个接口读取历史导入表，适合查看 09:00、13:00、18:00、23:59:59 固定拉取和手动触发留下的快照数据。
 
 查询参数：支持 `content_config_id`、`video_id`、`author_uid`、`author_name`、`label`、`date`、`date_from`、`date_to`、`limit`、`offset`。
 

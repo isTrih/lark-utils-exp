@@ -497,6 +497,53 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
 
     migrations.run(&pool).await?;
 
+    let active_run_id = repository
+        .start_run("heartbeat-integration", None, "test", None)
+        .await?;
+    assert!(repository.try_acquire_run_lease(active_run_id).await?);
+    sqlx::query(
+        "UPDATE workflow_run SET started_at = now() - interval '1 hour' WHERE workflow_run_id = $1",
+    )
+    .bind(active_run_id)
+    .execute(&pool)
+    .await?;
+    assert!(repository.heartbeat_run(active_run_id).await?);
+    assert_eq!(
+        repository
+            .reconcile_orphaned_runs_if_idle(Duration::from_secs(60))
+            .await?,
+        0,
+        "仍持续更新心跳的长任务不能被孤儿恢复误杀"
+    );
+    repository
+        .finish_run_success(active_run_id, json!({ "heartbeat": true }))
+        .await?;
+    repository.release_run_lease(active_run_id).await?;
+
+    let stale_run_id = repository
+        .start_run("stale-heartbeat-integration", None, "test", None)
+        .await?;
+    assert!(repository.try_acquire_run_lease(stale_run_id).await?);
+    sqlx::query(
+        "UPDATE workflow_run SET heartbeat_at = now() - interval '1 hour' WHERE workflow_run_id = $1",
+    )
+    .bind(stale_run_id)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE workflow_execution_lease SET lease_until = now() - interval '1 hour' WHERE workflow_run_id = $1",
+    )
+    .bind(stale_run_id)
+    .execute(&pool)
+    .await?;
+    assert_eq!(
+        repository
+            .reconcile_orphaned_runs_if_idle(Duration::from_secs(60))
+            .await?,
+        1,
+        "停止更新心跳的任务应被孤儿恢复回收"
+    );
+
     sqlx::query(
         "UPDATE xingtu_activity_content_config SET audit_table_id = NULL WHERE content_config_id = $1",
     )

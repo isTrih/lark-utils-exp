@@ -5,7 +5,10 @@ use crate::lark::message_history::{
 };
 use crate::lark::project_app::{FeishuAppMetadata, ProjectFeishuAppBinding};
 use crate::server::api::RequiredJsonBody;
-use crate::server::auth::{configured_xingtu_session_upload_token, require_mutation_token};
+use crate::server::auth::{
+    configured_xingtu_session_upload_token, require_default_actor, require_management_access,
+    require_project_route_access,
+};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::state_from_depot;
 use crate::workflow::XingtuWorkflowService;
@@ -49,20 +52,27 @@ async fn admin_js(res: &mut Response) {
 
 pub fn routes() -> Router {
     Router::with_path("admin")
-        .hoop(require_mutation_token)
-        .push(Router::with_path("periods/statuses").get(project_statuses))
+        .hoop(require_management_access)
+        .push(
+            Router::with_path("periods/statuses")
+                .hoop(require_default_actor)
+                .get(project_statuses),
+        )
         .push(
             Router::with_path("projects/{project_id}/periods")
+                .hoop(require_project_route_access)
                 .get(list_project_periods)
                 .post(create_project_period),
         )
         .push(
             Router::with_path("projects/{project_id}/periods/{activity_period_id}")
+                .hoop(require_project_route_access)
                 .get(get_project_period)
                 .put(replace_project_period),
         )
         .push(
             Router::with_path("projects/{project_id}/periods/{activity_period_id}/status")
+                .hoop(require_project_route_access)
                 .patch(update_project_period_status),
         )
         .push(
@@ -72,68 +82,134 @@ pub fn routes() -> Router {
         )
         .push(
             Router::with_path("projects/{project_id}")
+                .hoop(require_project_route_access)
                 .get(get_master_project)
                 .patch(update_master_project),
         )
         .push(
             Router::with_path("projects/{project_id}/notification")
+                .hoop(require_project_route_access)
                 .get(get_project_notification)
                 .patch(update_project_notification),
         )
         .push(
             Router::with_path("projects/{project_id}/feishu-app")
+                .hoop(require_default_actor)
                 .get(get_project_feishu_app)
                 .put(bind_project_feishu_app)
                 .delete(unbind_project_feishu_app),
         )
         .push(
             Router::with_path("feishu/apps")
+                .hoop(require_default_actor)
                 .get(list_feishu_apps)
                 .post(create_feishu_app),
         )
         .push(
             Router::with_path("feishu/apps/{feishu_app_id}")
+                .hoop(require_default_actor)
                 .get(get_feishu_app)
                 .put(replace_feishu_app),
         )
         .push(
+            Router::with_path("feishu/apps/{feishu_app_id}/project-access")
+                .hoop(require_default_actor)
+                .get(list_feishu_app_project_access)
+                .put(replace_feishu_app_project_access),
+        )
+        .push(
             Router::with_path("projects/{project_id}/accounts")
+                .hoop(require_project_route_access)
                 .get(list_project_accounts)
                 .post(create_project_account),
         )
         .push(
             Router::with_path("projects/{project_id}/accounts/{xingtu_account_id}")
+                .hoop(require_project_route_access)
                 .patch(update_project_account),
         )
         .push(
             Router::with_path("projects/{project_id}/auditors")
+                .hoop(require_project_route_access)
                 .get(list_project_auditors)
                 .post(create_project_auditor),
         )
         .push(
             Router::with_path("projects/{project_id}/auditors/{project_auditor_id}")
+                .hoop(require_project_route_access)
                 .patch(update_project_auditor),
         )
-        .push(Router::with_path("card-messages").get(list_card_messages))
-        .push(Router::with_path("card-messages/{message_id}/recall").post(recall_card_message))
-        .push(Router::with_path("workflow-runs").get(list_workflow_runs))
-        .push(Router::with_path("workflow-runs/{workflow_run_id}/steps").get(list_workflow_steps))
-        .push(Router::with_path("failed-sources").get(list_failed_sources))
         .push(
-            Router::with_path("failed-sources/{feishu_source_id}/retry").post(retry_failed_source),
+            Router::with_path("card-messages")
+                .hoop(require_default_actor)
+                .get(list_card_messages),
+        )
+        .push(
+            Router::with_path("card-messages/{message_id}/recall")
+                .hoop(require_default_actor)
+                .post(recall_card_message),
+        )
+        .push(
+            Router::with_path("workflow-runs")
+                .hoop(require_default_actor)
+                .get(list_workflow_runs),
+        )
+        .push(
+            Router::with_path("workflow-runs/{workflow_run_id}/steps")
+                .hoop(require_default_actor)
+                .get(list_workflow_steps),
+        )
+        .push(
+            Router::with_path("failed-sources")
+                .hoop(require_default_actor)
+                .get(list_failed_sources),
+        )
+        .push(
+            Router::with_path("failed-sources/{feishu_source_id}/retry")
+                .hoop(require_default_actor)
+                .post(retry_failed_source),
         )
         .push(
             Router::with_path("failed-sources/{feishu_source_id}/ignore")
+                .hoop(require_default_actor)
                 .post(ignore_failed_source),
         )
-        .push(Router::with_path("quarantine").get(list_quarantine))
-        .push(Router::with_path("live-sessions/normalize").post(normalize_live_sessions))
-        .push(Router::with_path("status").get(system_status))
-        .push(Router::with_path("xingtu/session-upload-token").get(get_xingtu_session_upload_token))
-        .push(crate::server::admin_sheet::routes())
-        .push(Router::with_path("feishu/bitable/tables").get(list_bitable_tables))
-        .push(Router::with_path("feishu/chats").get(list_bot_chats))
-        .push(Router::with_path("feishu/chats/{chat_id}/members").get(list_chat_members))
+        .push(
+            Router::with_path("quarantine")
+                .hoop(require_default_actor)
+                .get(list_quarantine),
+        )
+        .push(
+            Router::with_path("live-sessions/normalize")
+                .hoop(require_default_actor)
+                .post(normalize_live_sessions),
+        )
+        .push(
+            Router::with_path("status")
+                .hoop(require_default_actor)
+                .get(system_status),
+        )
+        .push(
+            Router::with_path("xingtu/session-upload-token")
+                .hoop(require_default_actor)
+                .get(get_xingtu_session_upload_token),
+        )
+        .push(crate::server::admin_sheet::routes().hoop(require_default_actor))
+        .push(
+            Router::with_path("feishu/bitable/tables")
+                .hoop(require_default_actor)
+                .get(list_bitable_tables),
+        )
+        .push(
+            Router::with_path("feishu/chats")
+                .hoop(require_default_actor)
+                .get(list_bot_chats),
+        )
+        .push(
+            Router::with_path("feishu/chats/{chat_id}/members")
+                .hoop(require_default_actor)
+                .get(list_chat_members),
+        )
 }
 
 #[derive(Debug, Deserialize, Serialize, ToParameters, ToSchema)]
@@ -487,6 +563,31 @@ struct BindProjectFeishuAppRequest {
     feishu_app_id: i64,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+struct FeishuAppProjectAccessDto {
+    project_id: i64,
+    project_key: String,
+    project_display_name: String,
+    can_view: bool,
+    can_manage: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct ReplaceFeishuAppProjectAccessRequest {
+    projects: Vec<FeishuAppProjectAccessInput>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct FeishuAppProjectAccessInput {
+    project_id: i64,
+    #[serde(default = "default_true")]
+    can_view: bool,
+    #[serde(default)]
+    can_manage: bool,
+}
+
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct CreateMasterProjectRequest {
@@ -685,11 +786,14 @@ async fn list_master_projects(
         .bind(query.include_inactive.unwrap_or(true))
         .fetch_all(&state.pool)
         .await?;
-    Ok(Json(
-        rows.into_iter()
-            .map(master_project_from_row)
-            .collect::<Result<Vec<_>, _>>()?,
-    ))
+    let mut projects = rows
+        .into_iter()
+        .map(master_project_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(project_ids) = crate::server::auth::actor_from_depot(depot)?.visible_project_ids() {
+        projects.retain(|project| project_ids.contains(&project.project_id));
+    }
+    Ok(Json(projects))
 }
 
 #[endpoint(tags("admin"), summary = "查询主项目及账号、审核员、期次")]
@@ -708,6 +812,9 @@ async fn create_master_project(
     body: RequiredJsonBody<CreateMasterProjectRequest>,
     depot: &mut Depot,
 ) -> ApiResult<MasterProjectDetailDto> {
+    if !crate::server::auth::actor_from_depot(depot)?.is_default_admin() {
+        return Err(ApiError::forbidden("只有默认飞书应用管理员可以创建主项目"));
+    }
     let state = state_from_depot(depot)?;
     let body = body.into_inner();
     let project_key = required_text(&body.project_key, "project_key")?;
@@ -739,6 +846,100 @@ async fn create_master_project(
     state.query_cache.invalidate_all_shared().await?;
     Ok(Json(
         fetch_master_project_detail(&state.pool, project_id).await?,
+    ))
+}
+
+#[endpoint(tags("admin"), summary = "查询非默认飞书应用的项目访问权限")]
+async fn list_feishu_app_project_access(
+    path: FeishuAppPath,
+    depot: &mut Depot,
+) -> ApiResult<Vec<FeishuAppProjectAccessDto>> {
+    let state = state_from_depot(depot)?;
+    ensure_feishu_app_exists(&state.pool, path.feishu_app_id).await?;
+    Ok(Json(
+        fetch_feishu_app_project_access(&state.pool, path.feishu_app_id).await?,
+    ))
+}
+
+#[endpoint(tags("admin"), summary = "完整替换非默认飞书应用的可见及可配置项目")]
+async fn replace_feishu_app_project_access(
+    path: FeishuAppPath,
+    body: RequiredJsonBody<ReplaceFeishuAppProjectAccessRequest>,
+    depot: &mut Depot,
+) -> ApiResult<Vec<FeishuAppProjectAccessDto>> {
+    let state = state_from_depot(depot)?;
+    let body = body.into_inner();
+    let mut seen = std::collections::HashSet::new();
+    for project in &body.projects {
+        if project.project_id <= 0 {
+            return Err(ApiError::bad_request("project_id 必须大于 0"));
+        }
+        if project.can_manage && !project.can_view {
+            return Err(ApiError::bad_request(
+                "can_manage=true 时 can_view 必须为 true",
+            ));
+        }
+        if !seen.insert(project.project_id) {
+            return Err(ApiError::bad_request(format!(
+                "project_id {} 重复",
+                project.project_id
+            )));
+        }
+    }
+    let mut tx = state.pool.begin().await?;
+    let app_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM xingtu_feishu_app WHERE feishu_app_id = $1)",
+    )
+    .bind(path.feishu_app_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !app_exists {
+        return Err(ApiError::not_found("飞书应用不存在"));
+    }
+    let requested_project_ids = body
+        .projects
+        .iter()
+        .map(|project| project.project_id)
+        .collect::<Vec<_>>();
+    let existing_project_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT project_id FROM xingtu_project WHERE project_id = ANY($1)",
+    )
+    .bind(&requested_project_ids)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .collect::<std::collections::HashSet<_>>();
+    if let Some(missing_id) = requested_project_ids
+        .iter()
+        .find(|project_id| !existing_project_ids.contains(project_id))
+    {
+        return Err(ApiError::not_found(format!("主项目不存在：{missing_id}")));
+    }
+    sqlx::query("DELETE FROM xingtu_feishu_app_project_access WHERE feishu_app_id = $1")
+        .bind(path.feishu_app_id)
+        .execute(&mut *tx)
+        .await?;
+    for project in body.projects {
+        if !project.can_view {
+            continue;
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO xingtu_feishu_app_project_access (
+                feishu_app_id, project_id, can_view, can_manage
+            ) VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(path.feishu_app_id)
+        .bind(project.project_id)
+        .bind(project.can_view)
+        .bind(project.can_manage)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Json(
+        fetch_feishu_app_project_access(&state.pool, path.feishu_app_id).await?,
     ))
 }
 
@@ -2297,6 +2498,55 @@ async fn ensure_project_exists(pool: &PgPool, project_id: i64) -> Result<(), Api
         return Err(ApiError::not_found("主项目不存在"));
     }
     Ok(())
+}
+
+async fn ensure_feishu_app_exists(pool: &PgPool, feishu_app_id: i64) -> Result<(), ApiError> {
+    if feishu_app_id <= 0 {
+        return Err(ApiError::bad_request("feishu_app_id 必须大于 0"));
+    }
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM xingtu_feishu_app WHERE feishu_app_id = $1)",
+    )
+    .bind(feishu_app_id)
+    .fetch_one(pool)
+    .await?;
+    if exists {
+        Ok(())
+    } else {
+        Err(ApiError::not_found("飞书应用不存在"))
+    }
+}
+
+async fn fetch_feishu_app_project_access(
+    pool: &PgPool,
+    feishu_app_id: i64,
+) -> Result<Vec<FeishuAppProjectAccessDto>, ApiError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT access.project_id, project.project_key,
+            project.display_name AS project_display_name,
+            access.can_view, access.can_manage
+        FROM xingtu_feishu_app_project_access access
+        JOIN xingtu_project project ON project.project_id = access.project_id
+        WHERE access.feishu_app_id = $1
+        ORDER BY project.project_key, project.project_id
+        "#,
+    )
+    .bind(feishu_app_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(FeishuAppProjectAccessDto {
+                project_id: row.try_get("project_id")?,
+                project_key: row.try_get("project_key")?,
+                project_display_name: row.try_get("project_display_name")?,
+                can_view: row.try_get("can_view")?,
+                can_manage: row.try_get("can_manage")?,
+            })
+        })
+        .collect::<Result<_, sqlx::Error>>()
+        .map_err(Into::into)
 }
 
 fn master_project_account_from_row(row: PgRow) -> Result<MasterProjectAccountDto, sqlx::Error> {
