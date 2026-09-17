@@ -101,6 +101,13 @@ pub fn routes() -> Router {
                 .delete(unbind_project_feishu_app),
         )
         .push(
+            Router::with_path("projects/{project_id}/audit-notice-feishu-app")
+                .hoop(require_default_actor)
+                .get(get_project_audit_notice_feishu_app)
+                .put(bind_project_audit_notice_feishu_app)
+                .delete(unbind_project_audit_notice_feishu_app),
+        )
+        .push(
             Router::with_path("feishu/apps")
                 .hoop(require_default_actor)
                 .get(list_feishu_apps)
@@ -510,6 +517,7 @@ pub struct MasterProjectDetailDto {
     #[serde(flatten)]
     pub project: MasterProjectDto,
     pub feishu_app: ProjectFeishuAppBindingDto,
+    pub audit_notice_feishu_app: ProjectAuditNoticeFeishuAppBindingDto,
     pub notification: ProjectNotificationDto,
     pub accounts: Vec<MasterProjectAccountDto>,
     pub auditors: Vec<ProjectAuditorDto>,
@@ -533,6 +541,16 @@ pub struct FeishuAppDto {
 pub struct ProjectFeishuAppBindingDto {
     pub project_id: i64,
     pub uses_global_fallback: bool,
+    pub app: Option<FeishuAppDto>,
+    pub bound_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ProjectAuditNoticeFeishuAppBindingDto {
+    pub project_id: i64,
+    /// true 时审核通知复用项目数据处理应用，不存在额外凭据副本。
+    pub uses_project_feishu_app: bool,
     pub app: Option<FeishuAppDto>,
     pub bound_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
@@ -1211,6 +1229,71 @@ async fn unbind_project_feishu_app(
     Ok(Json(project_feishu_app_binding_dto(path.project_id, None)))
 }
 
+#[endpoint(tags("admin"), summary = "查询项目独立审核通知飞书应用")]
+async fn get_project_audit_notice_feishu_app(
+    path: ProjectPath,
+    depot: &mut Depot,
+) -> ApiResult<ProjectAuditNoticeFeishuAppBindingDto> {
+    let state = state_from_depot(depot)?;
+    ensure_project_exists(&state.pool, path.project_id).await?;
+    let binding = state
+        .workflow
+        .project_lark
+        .get_audit_notice_project_binding(path.project_id)
+        .await
+        .map_err(map_feishu_app_error)?;
+    Ok(Json(project_audit_notice_feishu_app_binding_dto(
+        path.project_id,
+        binding,
+    )))
+}
+
+#[endpoint(tags("admin"), summary = "绑定项目独立审核通知飞书应用")]
+async fn bind_project_audit_notice_feishu_app(
+    path: ProjectPath,
+    body: RequiredJsonBody<BindProjectFeishuAppRequest>,
+    depot: &mut Depot,
+) -> ApiResult<ProjectAuditNoticeFeishuAppBindingDto> {
+    let state = state_from_depot(depot)?;
+    ensure_project_exists(&state.pool, path.project_id).await?;
+    let body = body.into_inner();
+    if body.feishu_app_id <= 0 {
+        return Err(ApiError::bad_request("feishu_app_id 必须大于 0"));
+    }
+    let binding = state
+        .workflow
+        .project_lark
+        .bind_audit_notice_project(path.project_id, body.feishu_app_id)
+        .await
+        .map_err(map_feishu_app_error)?;
+    Ok(Json(project_audit_notice_feishu_app_binding_dto(
+        path.project_id,
+        Some(binding),
+    )))
+}
+
+#[endpoint(tags("admin"), summary = "解除独立审核通知应用并恢复复用项目应用")]
+async fn unbind_project_audit_notice_feishu_app(
+    path: ProjectPath,
+    depot: &mut Depot,
+) -> ApiResult<ProjectAuditNoticeFeishuAppBindingDto> {
+    let state = state_from_depot(depot)?;
+    ensure_project_exists(&state.pool, path.project_id).await?;
+    if !state
+        .workflow
+        .project_lark
+        .unbind_audit_notice_project(path.project_id)
+        .await
+        .map_err(map_feishu_app_error)?
+    {
+        return Err(ApiError::not_found("该项目尚未绑定独立审核通知应用"));
+    }
+    Ok(Json(project_audit_notice_feishu_app_binding_dto(
+        path.project_id,
+        None,
+    )))
+}
+
 #[endpoint(tags("admin"), summary = "查询项目通知配置")]
 async fn get_project_notification(
     path: ProjectPath,
@@ -1771,15 +1854,22 @@ async fn recall_card_message(
     }
 
     repo.mark_recall_started(&message_id).await?;
-    let lark = match history.project_id {
-        Some(project_id) => {
+    let lark = match (history.sender_feishu_app_id, history.project_id) {
+        (Some(feishu_app_id), _) => {
+            state
+                .workflow
+                .project_lark
+                .client_for_feishu_app(feishu_app_id)
+                .await?
+        }
+        (None, Some(project_id)) => {
             state
                 .workflow
                 .project_lark
                 .client_for_project(project_id)
                 .await?
         }
-        None => state.workflow.lark.clone(),
+        (None, None) => state.workflow.lark.clone(),
     };
     if let Err(error) = FeishuImClient::new(&lark).recall_message(&message_id).await {
         let error_detail = format!("{error:#}");
@@ -2416,45 +2506,22 @@ async fn fetch_master_project_detail(
     .bind(project_id)
     .fetch_all(pool)
     .await?;
-    let app_row = sqlx::query(
-        r#"
-        SELECT binding.project_id, binding.created_at AS bound_at,
-            binding.updated_at AS binding_updated_at,
-            app.feishu_app_id, app.app_id, app.display_name, app.encryption_key_id,
-            app.is_active, app.created_at, app.updated_at,
-            (SELECT count(*) FROM xingtu_project_feishu_app_binding item
-             WHERE item.feishu_app_id = app.feishu_app_id) AS project_count
-        FROM xingtu_project_feishu_app_binding binding
-        JOIN xingtu_feishu_app app ON app.feishu_app_id = binding.feishu_app_id
-        WHERE binding.project_id = $1
-        "#,
+    let app_binding =
+        fetch_project_app_binding(pool, project_id, "xingtu_project_feishu_app_binding").await?;
+    let audit_notice_app_binding = fetch_project_app_binding(
+        pool,
+        project_id,
+        "xingtu_project_audit_notice_feishu_app_binding",
     )
-    .bind(project_id)
-    .fetch_optional(pool)
     .await?;
-    let app_binding = app_row
-        .map(|row| {
-            Ok::<_, sqlx::Error>(ProjectFeishuAppBinding {
-                project_id: row.try_get("project_id")?,
-                bound_at: row.try_get("bound_at")?,
-                binding_updated_at: row.try_get("binding_updated_at")?,
-                app: FeishuAppMetadata {
-                    feishu_app_id: row.try_get("feishu_app_id")?,
-                    app_id: row.try_get("app_id")?,
-                    display_name: row.try_get("display_name")?,
-                    encryption_key_id: row.try_get("encryption_key_id")?,
-                    is_active: row.try_get("is_active")?,
-                    project_count: row.try_get("project_count")?,
-                    created_at: row.try_get("created_at")?,
-                    updated_at: row.try_get("updated_at")?,
-                },
-            })
-        })
-        .transpose()?;
 
     Ok(MasterProjectDetailDto {
         project: master_project_from_row(project_row)?,
         feishu_app: project_feishu_app_binding_dto(project_id, app_binding),
+        audit_notice_feishu_app: project_audit_notice_feishu_app_binding_dto(
+            project_id,
+            audit_notice_app_binding,
+        ),
         notification: fetch_project_notification(pool, project_id).await?,
         accounts: account_rows
             .into_iter()
@@ -2469,6 +2536,53 @@ async fn fetch_master_project_detail(
             .map(activity_from_row)
             .collect::<Result<Vec<_>, _>>()?,
     })
+}
+
+async fn fetch_project_app_binding(
+    pool: &PgPool,
+    project_id: i64,
+    table: &str,
+) -> Result<Option<ProjectFeishuAppBinding>, sqlx::Error> {
+    let sql = format!(
+        r#"
+        SELECT binding.project_id, binding.created_at AS bound_at,
+            binding.updated_at AS binding_updated_at,
+            app.feishu_app_id, app.app_id, app.display_name, app.encryption_key_id,
+            app.is_active, app.created_at, app.updated_at,
+            (SELECT count(DISTINCT project_id) FROM (
+                SELECT project_id FROM xingtu_project_feishu_app_binding
+                WHERE feishu_app_id = app.feishu_app_id
+                UNION
+                SELECT project_id FROM xingtu_project_audit_notice_feishu_app_binding
+                WHERE feishu_app_id = app.feishu_app_id
+            ) projects) AS project_count
+        FROM {table} binding
+        JOIN xingtu_feishu_app app ON app.feishu_app_id = binding.feishu_app_id
+        WHERE binding.project_id = $1
+        "#
+    );
+    let row = sqlx::query(&sql)
+        .bind(project_id)
+        .fetch_optional(pool)
+        .await?;
+    row.map(|row| {
+        Ok(ProjectFeishuAppBinding {
+            project_id: row.try_get("project_id")?,
+            bound_at: row.try_get("bound_at")?,
+            binding_updated_at: row.try_get("binding_updated_at")?,
+            app: FeishuAppMetadata {
+                feishu_app_id: row.try_get("feishu_app_id")?,
+                app_id: row.try_get("app_id")?,
+                display_name: row.try_get("display_name")?,
+                encryption_key_id: row.try_get("encryption_key_id")?,
+                is_active: row.try_get("is_active")?,
+                project_count: row.try_get("project_count")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+            },
+        })
+    })
+    .transpose()
 }
 
 fn master_project_from_row(row: PgRow) -> Result<MasterProjectDto, sqlx::Error> {
@@ -2514,6 +2628,28 @@ fn project_feishu_app_binding_dto(
         None => ProjectFeishuAppBindingDto {
             project_id,
             uses_global_fallback: true,
+            app: None,
+            bound_at: None,
+            updated_at: None,
+        },
+    }
+}
+
+fn project_audit_notice_feishu_app_binding_dto(
+    project_id: i64,
+    binding: Option<ProjectFeishuAppBinding>,
+) -> ProjectAuditNoticeFeishuAppBindingDto {
+    match binding {
+        Some(binding) => ProjectAuditNoticeFeishuAppBindingDto {
+            project_id,
+            uses_project_feishu_app: false,
+            app: Some(feishu_app_dto(binding.app)),
+            bound_at: Some(binding.bound_at),
+            updated_at: Some(binding.binding_updated_at),
+        },
+        None => ProjectAuditNoticeFeishuAppBindingDto {
+            project_id,
+            uses_project_feishu_app: true,
             app: None,
             bound_at: None,
             updated_at: None,
@@ -3134,6 +3270,7 @@ mod tests {
             "/api/v1/admin/projects/{project_id}",
             "/api/v1/admin/projects/{project_id}/notification",
             "/api/v1/admin/projects/{project_id}/feishu-app",
+            "/api/v1/admin/projects/{project_id}/audit-notice-feishu-app",
             "/api/v1/admin/projects/{project_id}/accounts",
             "/api/v1/admin/projects/{project_id}/accounts/{xingtu_account_id}",
             "/api/v1/admin/projects/{project_id}/auditors",

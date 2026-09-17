@@ -1206,7 +1206,7 @@ impl XingtuWorkflowService {
 
         let project_lark = match self
             .project_lark
-            .client_for_project(account.project_id)
+            .resolved_client_for_project(account.project_id)
             .await
         {
             Ok(client) => client,
@@ -1215,7 +1215,7 @@ impl XingtuWorkflowService {
                 return None;
             }
         };
-        match FeishuImClient::new(&project_lark)
+        match FeishuImClient::new(&project_lark.client)
             .send_xingtu_login_notice(&receiver, &notice)
             .await
         {
@@ -1229,6 +1229,7 @@ impl XingtuWorkflowService {
                         &receiver,
                         Some(&project_name),
                         Some(account.project_id),
+                        project_lark.feishu_app_id,
                         None,
                     )
                     .await;
@@ -1312,12 +1313,12 @@ impl XingtuWorkflowService {
         let mut audit_notice_sent = false;
 
         for notice_config in notice_configs {
-            let project_lark = self
+            let project_data_lark = self
                 .project_lark
                 .client_for_project(notice_config.project_id)
                 .await?;
             let project_name = notice_config.project_name.clone();
-            let audit_info = build_pending_audit_info(&project_lark, &notice_config)
+            let audit_info = build_pending_audit_info(&project_data_lark, &notice_config)
                 .await
                 .with_context(|| format!("构建项目 `{project_name}` 审核通知卡片参数失败"))?;
             pending_items.extend(audit_info.iter().map(|item| AuditNoticeItemResult {
@@ -1358,7 +1359,12 @@ impl XingtuWorkflowService {
                 notice_config.project_name.trim(),
                 audit_info,
             );
-            let result = FeishuImClient::new(&project_lark)
+            let notice_lark = self
+                .project_lark
+                .resolved_client_for_audit_notice(notice_config.project_id)
+                .await
+                .with_context(|| format!("初始化项目 `{project_name}` 的审核通知飞书应用失败"))?;
+            let result = FeishuImClient::new(&notice_lark.client)
                 .send_audit_review_notice(&notice_config.receiver, &card)
                 .await
                 .with_context(|| format!("发送项目 `{project_name}` 审核通知失败"));
@@ -1384,6 +1390,7 @@ impl XingtuWorkflowService {
                     &notice_config.receiver,
                     Some(&project_name),
                     Some(notice_config.project_id),
+                    notice_lark.feishu_app_id,
                     None,
                 )
                 .await;

@@ -768,6 +768,10 @@ GET    /api/v1/admin/projects/{project_id}/feishu-app
 PUT    /api/v1/admin/projects/{project_id}/feishu-app
 DELETE /api/v1/admin/projects/{project_id}/feishu-app
 
+GET    /api/v1/admin/projects/{project_id}/audit-notice-feishu-app
+PUT    /api/v1/admin/projects/{project_id}/audit-notice-feishu-app
+DELETE /api/v1/admin/projects/{project_id}/audit-notice-feishu-app
+
 GET  /api/v1/admin/feishu/apps
 POST /api/v1/admin/feishu/apps
 GET  /api/v1/admin/feishu/apps/{feishu_app_id}
@@ -787,6 +791,19 @@ GET   /api/v1/admin/projects/{project_id}/periods/{activity_period_id}
 PUT   /api/v1/admin/projects/{project_id}/periods/{activity_period_id}
 PATCH /api/v1/admin/projects/{project_id}/periods/{activity_period_id}/status
 ```
+
+项目工作流状态提供两个只读查询接口，均要求登录 JWT 或 `INTERNAL_API_TOKEN`，非默认应用只能查询
+已授权可见的项目：
+
+```text
+GET /api/v1/queries/projects/{project_id}/workflows/today
+GET /api/v1/queries/projects/{project_id}/workflows/latest
+```
+
+`today` 按北京时间 `00:00:00` 到当前时间返回项目今日参与过的全部 workflow；`latest` 返回最近
+一条，从未运行时 `data` 为 `null`。定时批量 workflow 可能同时执行多个项目，这两个接口的
+`status`、`activity_period_ids` 和 `error_messages` 只根据指定项目的期次阶段计算，不会把同批次
+其他项目的失败误报到当前项目。
 
 ### 项目级飞书开放平台应用
 
@@ -822,14 +839,27 @@ Content-Type: application/json
 
 解除绑定后，该项目恢复使用 `DEFAULT_FEISHU_APP_ID` 指定的数据库默认应用。旧部署未配置该变量时，
 才回退使用环境变量 `LARK_APP_ID`、`LARK_APP_SECRET`。
-工作流中的来源 Sheet 导入、主表与审核表同步、审核/错误通知、日报卡片和消息撤回都会按项目
-选择应用。同一飞书应用绑定多个项目时会共用该应用的 tenant access token 缓存。
+工作流中的来源 Sheet 导入、主表与审核表同步、错误通知和日报卡片都会按项目选择数据处理应用。
+审核通知默认也复用该应用；少数需要分离机器人的项目可额外绑定审核通知应用：
+
+```http
+PUT /api/v1/admin/projects/1/audit-notice-feishu-app
+Content-Type: application/json
+
+{ "feishu_app_id": 3 }
+```
+
+该覆盖只用于发送审核通知卡片，待审核数据仍由项目数据处理应用读取，因此通知应用不需要访问项目
+多维表格。`DELETE` 该绑定即可恢复复用项目应用。发送历史会记录实际发送应用，确保后续切换绑定后
+仍可用正确应用撤回旧卡片。同一飞书应用可作为多个项目的数据应用或审核通知应用，并共用 tenant
+access token 缓存。
 
 管理类飞书接口可增加 `project_id` 查询参数，以指定应用身份：群列表、群成员、多维表数据表枚举。
 电子表格格式化接口则在 JSON 请求体中增加可选 `project_id`。不传时均使用全局兜底应用。
 
-`GET /projects/{project_id}` 会同时返回 `feishu_app`、`notification`、`accounts`、`auditors` 和
-`periods`；未绑定应用时 `feishu_app.uses_global_fallback=true`。
+`GET /projects/{project_id}` 会同时返回 `feishu_app`、`audit_notice_feishu_app`、`notification`、
+`accounts`、`auditors` 和 `periods`；未绑定数据应用时 `feishu_app.uses_global_fallback=true`；
+未绑定独立审核通知应用时 `audit_notice_feishu_app.uses_project_feishu_app=true`。
 创建项目时通知配置必填：
 
 ```json

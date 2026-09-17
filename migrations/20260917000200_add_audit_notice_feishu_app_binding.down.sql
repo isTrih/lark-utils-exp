@@ -1,0 +1,5 @@
+ALTER TABLE card_message_history DROP COLUMN IF EXISTS sender_feishu_app_id;
+
+DROP TRIGGER IF EXISTS trg_xingtu_project_audit_notice_feishu_app_binding_updated_at
+    ON xingtu_project_audit_notice_feishu_app_binding;
+DROP TABLE IF EXISTS xingtu_project_audit_notice_feishu_app_binding;

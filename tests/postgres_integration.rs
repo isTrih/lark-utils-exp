@@ -90,15 +90,6 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     repository
         .finish_run_success(run_id, json!({ "ok": true }))
         .await?;
-    let run = repository
-        .list_runs(100, 0)
-        .await?
-        .into_iter()
-        .find(|run| run.workflow_run_id == run_id)
-        .expect("运行台账应可查询");
-    assert_eq!(run.status, "succeeded");
-    assert_eq!(repository.list_steps(run_id).await?.len(), 1);
-
     let scope = format!("integration-{run_id}");
     assert!(
         repository
@@ -496,6 +487,61 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     assert!(legacy_video_extra.0["key"].is_object());
 
     migrations.run(&pool).await?;
+
+    let run = repository
+        .list_runs(100, 0)
+        .await?
+        .into_iter()
+        .find(|run| run.workflow_run_id == run_id)
+        .expect("运行台账应可查询");
+    assert_eq!(run.status, "succeeded");
+    assert_eq!(repository.list_steps(run_id).await?.len(), 1);
+
+    let project_run_id = repository
+        .start_run(
+            "project-query-integration",
+            Some(activity_period_id),
+            "test",
+            None,
+        )
+        .await?;
+    let project_step_id = repository
+        .start_step(
+            project_run_id,
+            Some(activity_period_id),
+            "project_query_contract",
+            None,
+        )
+        .await?;
+    repository
+        .finish_step_success(project_step_id, json!({ "rows": 1 }))
+        .await?;
+    repository
+        .finish_run_success(project_run_id, json!({ "ok": true }))
+        .await?;
+    let project_runs_today = repository.list_project_runs_today(project_id).await?;
+    let project_run = project_runs_today
+        .iter()
+        .find(|run| run.workflow_run_id == project_run_id)
+        .expect("项目今日工作流应包含指定期次运行");
+    assert_eq!(project_run.project_id, project_id);
+    assert_eq!(project_run.status, "succeeded");
+    assert_eq!(project_run.activity_period_ids, vec![activity_period_id]);
+    assert_eq!(project_run.step_count, 1);
+    assert_eq!(
+        repository
+            .latest_project_run(project_id)
+            .await?
+            .expect("项目最近工作流应存在")
+            .workflow_run_id,
+        project_run_id
+    );
+    assert!(
+        repository
+            .latest_project_run(other_project_id)
+            .await?
+            .is_none()
+    );
 
     let active_run_id = repository
         .start_run("heartbeat-integration", None, "test", None)
@@ -1022,6 +1068,10 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     sqlx::query("DELETE FROM xingtu_feishu_source WHERE content_config_id IN ($1, $2)")
         .bind(content_config_id)
         .bind(live_content_config_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM workflow_run WHERE workflow_run_id = $1")
+        .bind(project_run_id)
         .execute(&pool)
         .await?;
     sqlx::query("DELETE FROM xingtu_activity_period WHERE activity_period_id = $1")

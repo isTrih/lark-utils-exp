@@ -39,6 +39,23 @@ pub struct WorkflowStepRecord {
     pub error_message: Option<String>,
 }
 
+/// 按项目裁剪后的工作流状态，不泄露同批次其他项目的汇总和错误详情。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ProjectWorkflowRunRecord {
+    pub workflow_run_id: i64,
+    pub project_id: i64,
+    pub workflow_kind: String,
+    pub trigger_source: String,
+    pub status: String,
+    pub activity_period_ids: Vec<i64>,
+    pub step_count: i64,
+    pub started_at: DateTime<Utc>,
+    pub heartbeat_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub error_messages: Vec<String>,
+    pub request_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkflowRunRepository {
     pool: PgPool,
@@ -350,6 +367,135 @@ impl WorkflowRunRepository {
         rows.into_iter().map(step_from_row).collect()
     }
 
+    pub async fn list_project_runs_today(
+        &self,
+        project_id: i64,
+    ) -> anyhow::Result<Vec<ProjectWorkflowRunRecord>> {
+        self.list_project_runs(project_id, true, 1_000).await
+    }
+
+    pub async fn latest_project_run(
+        &self,
+        project_id: i64,
+    ) -> anyhow::Result<Option<ProjectWorkflowRunRecord>> {
+        Ok(self
+            .list_project_runs(project_id, false, 1)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    async fn list_project_runs(
+        &self,
+        project_id: i64,
+        today_only: bool,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ProjectWorkflowRunRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                run.workflow_run_id,
+                $1::bigint AS project_id,
+                run.workflow_kind,
+                run.trigger_source,
+                CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM workflow_step step
+                        JOIN xingtu_activity_period period
+                            ON period.activity_period_id = step.activity_period_id
+                        WHERE step.workflow_run_id = run.workflow_run_id
+                            AND period.project_id = $1 AND step.status = 'running'
+                    ) THEN 'running'
+                    WHEN EXISTS (
+                        SELECT 1 FROM workflow_step step
+                        JOIN xingtu_activity_period period
+                            ON period.activity_period_id = step.activity_period_id
+                        WHERE step.workflow_run_id = run.workflow_run_id
+                            AND period.project_id = $1 AND step.status = 'failed'
+                    ) THEN 'failed'
+                    WHEN EXISTS (
+                        SELECT 1 FROM workflow_step step
+                        JOIN xingtu_activity_period period
+                            ON period.activity_period_id = step.activity_period_id
+                        WHERE step.workflow_run_id = run.workflow_run_id
+                            AND period.project_id = $1 AND step.status = 'succeeded'
+                    ) THEN 'succeeded'
+                    WHEN EXISTS (
+                        SELECT 1 FROM workflow_step step
+                        JOIN xingtu_activity_period period
+                            ON period.activity_period_id = step.activity_period_id
+                        WHERE step.workflow_run_id = run.workflow_run_id
+                            AND period.project_id = $1 AND step.status = 'skipped'
+                    ) THEN 'skipped'
+                    ELSE run.status
+                END AS status,
+                ARRAY(
+                    SELECT period.activity_period_id
+                    FROM xingtu_activity_period period
+                    WHERE period.project_id = $1
+                        AND (
+                            period.activity_period_id = run.scope_activity_period_id
+                            OR EXISTS (
+                                SELECT 1 FROM workflow_step step
+                                WHERE step.workflow_run_id = run.workflow_run_id
+                                    AND step.activity_period_id = period.activity_period_id
+                            )
+                        )
+                    ORDER BY period.activity_period_id
+                ) AS activity_period_ids,
+                (
+                    SELECT count(*) FROM workflow_step step
+                    JOIN xingtu_activity_period period
+                        ON period.activity_period_id = step.activity_period_id
+                    WHERE step.workflow_run_id = run.workflow_run_id
+                        AND period.project_id = $1
+                ) AS step_count,
+                run.started_at,
+                run.heartbeat_at,
+                run.finished_at,
+                ARRAY(
+                    SELECT DISTINCT step.error_message
+                    FROM workflow_step step
+                    JOIN xingtu_activity_period period
+                        ON period.activity_period_id = step.activity_period_id
+                    WHERE step.workflow_run_id = run.workflow_run_id
+                        AND period.project_id = $1
+                        AND step.error_message IS NOT NULL
+                    ORDER BY step.error_message
+                ) AS error_messages,
+                run.request_id
+            FROM workflow_run run
+            WHERE EXISTS (
+                SELECT 1 FROM xingtu_activity_period period
+                WHERE period.project_id = $1
+                    AND (
+                        period.activity_period_id = run.scope_activity_period_id
+                        OR EXISTS (
+                            SELECT 1 FROM workflow_step step
+                            WHERE step.workflow_run_id = run.workflow_run_id
+                                AND step.activity_period_id = period.activity_period_id
+                        )
+                    )
+            )
+                AND (
+                    NOT $2
+                    OR run.started_at >= (
+                        (now() AT TIME ZONE 'Asia/Shanghai')::date::timestamp
+                        AT TIME ZONE 'Asia/Shanghai'
+                    )
+                )
+            ORDER BY run.started_at DESC, run.workflow_run_id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(project_id)
+        .bind(today_only)
+        .bind(limit.clamp(1, 1_000))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(project_run_from_row).collect()
+    }
+
     pub async fn claim_notification(
         &self,
         category: &str,
@@ -553,6 +699,23 @@ fn step_from_row(row: sqlx::postgres::PgRow) -> anyhow::Result<WorkflowStepRecor
         finished_at: row.try_get("finished_at")?,
         summary: row.try_get("summary")?,
         error_message: row.try_get("error_message")?,
+    })
+}
+
+fn project_run_from_row(row: sqlx::postgres::PgRow) -> anyhow::Result<ProjectWorkflowRunRecord> {
+    Ok(ProjectWorkflowRunRecord {
+        workflow_run_id: row.try_get("workflow_run_id")?,
+        project_id: row.try_get("project_id")?,
+        workflow_kind: row.try_get("workflow_kind")?,
+        trigger_source: row.try_get("trigger_source")?,
+        status: row.try_get("status")?,
+        activity_period_ids: row.try_get("activity_period_ids")?,
+        step_count: row.try_get("step_count")?,
+        started_at: row.try_get("started_at")?,
+        heartbeat_at: row.try_get("heartbeat_at")?,
+        finished_at: row.try_get("finished_at")?,
+        error_messages: row.try_get("error_messages")?,
+        request_id: row.try_get("request_id")?,
     })
 }
 

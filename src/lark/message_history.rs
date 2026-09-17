@@ -50,6 +50,7 @@ pub struct CardMessageHistory {
     pub receive_id: String,
     pub project_name: Option<String>,
     pub project_id: Option<i64>,
+    pub sender_feishu_app_id: Option<i64>,
     pub activity_period_id: Option<i64>,
     pub sent_at: DateTime<Utc>,
     pub last_recall_attempt_at: Option<DateTime<Utc>>,
@@ -87,6 +88,7 @@ impl CardMessageHistoryRepository {
         receiver: &MessageReceiver,
         project_name: Option<&str>,
         project_id: Option<i64>,
+        sender_feishu_app_id: Option<i64>,
         activity_period_id: Option<i64>,
     ) {
         let Some(message_id) = message_id.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -107,6 +109,7 @@ impl CardMessageHistoryRepository {
                 receiver,
                 project_name,
                 project_id,
+                sender_feishu_app_id,
                 activity_period_id,
             )
             .await
@@ -128,6 +131,7 @@ impl CardMessageHistoryRepository {
         receiver: &MessageReceiver,
         project_name: Option<&str>,
         project_id: Option<i64>,
+        sender_feishu_app_id: Option<i64>,
         activity_period_id: Option<i64>,
     ) -> anyhow::Result<()> {
         if summary.trim().is_empty() {
@@ -147,10 +151,11 @@ impl CardMessageHistoryRepository {
                 receive_id,
                 project_name,
                 project_id,
+                sender_feishu_app_id,
                 activity_period_id,
                 sent_at
             )
-            VALUES ($1, $2, $3, $4::xingtu_receive_id_type, $5, $6, $7, $8, now())
+            VALUES ($1, $2, $3, $4::xingtu_receive_id_type, $5, $6, $7, $8, $9, now())
             ON CONFLICT (message_id) DO NOTHING
             "#,
         )
@@ -161,6 +166,7 @@ impl CardMessageHistoryRepository {
         .bind(receiver.receive_id.trim())
         .bind(trim_optional(project_name))
         .bind(project_id)
+        .bind(sender_feishu_app_id)
         .bind(activity_period_id)
         .execute(&self.pool)
         .await
@@ -184,6 +190,7 @@ impl CardMessageHistoryRepository {
                 receive_id,
                 project_name,
                 project_id,
+                sender_feishu_app_id,
                 activity_period_id,
                 sent_at,
                 last_recall_attempt_at,
@@ -231,6 +238,7 @@ impl CardMessageHistoryRepository {
                 receive_id,
                 project_name,
                 project_id,
+                sender_feishu_app_id,
                 activity_period_id,
                 sent_at,
                 last_recall_attempt_at,
@@ -283,6 +291,7 @@ impl CardMessageHistoryRepository {
                 receive_id,
                 project_name,
                 project_id,
+                sender_feishu_app_id,
                 activity_period_id,
                 sent_at,
                 last_recall_attempt_at,
@@ -328,6 +337,7 @@ fn history_from_row(row: PgRow) -> anyhow::Result<CardMessageHistory> {
         receive_id: row.try_get("receive_id")?,
         project_name: row.try_get("project_name")?,
         project_id: row.try_get("project_id")?,
+        sender_feishu_app_id: row.try_get("sender_feishu_app_id")?,
         activity_period_id: row.try_get("activity_period_id")?,
         sent_at: row.try_get("sent_at")?,
         last_recall_attempt_at: row.try_get("last_recall_attempt_at")?,

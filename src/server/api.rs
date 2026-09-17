@@ -9,6 +9,7 @@ use crate::workflow::{
     AuditNoticeRunResult, LoginCheckResult, ManualRegistrationSyncResult, WorkflowRunResult,
     parse_workflow_kind,
 };
+use crate::workflow_run::ProjectWorkflowRunRecord;
 use crate::xingtu::XingtuSession;
 use salvo::extract::{Extractible, Metadata};
 use salvo::oapi::extract::JsonBody;
@@ -102,6 +103,14 @@ pub fn routes() -> Router {
                 .hoop(crate::server::auth::require_data_access)
                 .hoop(Timeout::new(std::time::Duration::from_secs(30)))
                 .push(Router::with_path("projects").get(list_current_projects))
+                .push(
+                    Router::with_path("projects/{project_id}/workflows/today")
+                        .get(list_project_workflows_today),
+                )
+                .push(
+                    Router::with_path("projects/{project_id}/workflows/latest")
+                        .get(get_latest_project_workflow),
+                )
                 .push(Router::with_path("periods").get(list_periods))
                 .push(Router::with_path("contents").get(list_contents))
                 .push(Router::with_path("feishu-sources").get(list_feishu_sources))
@@ -128,6 +137,57 @@ pub fn routes() -> Router {
                 .push(Router::with_path("v2/live-sessions").get(list_live_sessions_v2))
                 .push(Router::with_path("v2/feishu-sources").get(list_feishu_sources_v2)),
         )
+}
+
+#[derive(Debug, Deserialize, ToParameters)]
+struct QueryProjectPath {
+    project_id: i64,
+}
+
+#[endpoint(
+    tags("queries"),
+    summary = "查询项目今日全部工作流",
+    description = "按北京时间 00:00:00 至当前时间返回该项目参与过的全部工作流。批量工作流状态只根据本项目期次的阶段台账计算，不受同批其他项目成败影响。"
+)]
+async fn list_project_workflows_today(
+    path: QueryProjectPath,
+    depot: &mut Depot,
+) -> ApiResult<Vec<ProjectWorkflowRunRecord>> {
+    if path.project_id <= 0 {
+        return Err(ApiError::bad_request("project_id 必须大于 0"));
+    }
+    crate::server::auth::require_project_view(depot, path.project_id)?;
+    let state = state_from_depot(depot)?;
+    Ok(Json(
+        state
+            .workflow
+            .workflow_run_repo
+            .list_project_runs_today(path.project_id)
+            .await?,
+    ))
+}
+
+#[endpoint(
+    tags("queries"),
+    summary = "查询项目最近一次工作流状态",
+    description = "返回该项目最近参与的一次工作流；从未执行时 data 为 null。批量工作流状态和错误仅按本项目期次阶段计算。"
+)]
+async fn get_latest_project_workflow(
+    path: QueryProjectPath,
+    depot: &mut Depot,
+) -> ApiResult<Option<ProjectWorkflowRunRecord>> {
+    if path.project_id <= 0 {
+        return Err(ApiError::bad_request("project_id 必须大于 0"));
+    }
+    crate::server::auth::require_project_view(depot, path.project_id)?;
+    let state = state_from_depot(depot)?;
+    Ok(Json(
+        state
+            .workflow
+            .workflow_run_repo
+            .latest_project_run(path.project_id)
+            .await?,
+    ))
 }
 
 #[endpoint(tags("queries"), summary = "查询全部当前项目")]
@@ -176,11 +236,11 @@ async fn send_project_report(
     let project_lark = state
         .workflow
         .project_lark
-        .client_for_project(context.project_id)
+        .resolved_client_for_project(context.project_id)
         .await?;
     let context_project_id = context.project_id;
     let result = project_report::send_project_report(
-        &project_lark,
+        &project_lark.client,
         context,
         mission,
         body.hot_videos.as_deref(),
@@ -205,6 +265,7 @@ async fn send_project_report(
             &receiver,
             Some(&result.project),
             Some(context_project_id),
+            project_lark.feishu_app_id,
             Some(result.activity_period_id),
         )
         .await;
@@ -1238,6 +1299,8 @@ mod tests {
             "api/v1/queries/v2/audit-extra/search",
             "api/v1/queries/v2/audit-extra/live-pv/weighted-acu-below",
             "api/v1/queries/v2/audit-extra/video-play/author-total-below",
+            "api/v1/queries/projects/{project_id}/workflows/today",
+            "api/v1/queries/projects/{project_id}/workflows/latest",
         ] {
             assert!(
                 openapi.paths.contains_key(path),

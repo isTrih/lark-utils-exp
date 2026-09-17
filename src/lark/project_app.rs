@@ -29,6 +29,12 @@ pub struct ProjectFeishuAppBinding {
     pub binding_updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone)]
+pub struct ResolvedFeishuAppClient {
+    pub client: LarkClient,
+    pub feishu_app_id: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FeishuLoginApp {
     pub feishu_app_id: Option<i64>,
@@ -120,13 +126,18 @@ impl ProjectFeishuAppStore {
 
     /// 项目未绑定应用时使用 DEFAULT_FEISHU_APP_ID 指定的数据库默认客户端。
     pub async fn client_for_project(&self, project_id: i64) -> anyhow::Result<LarkClient> {
-        let row = sqlx::query(
+        Ok(self.resolved_client_for_project(project_id).await?.client)
+    }
+
+    pub async fn resolved_client_for_project(
+        &self,
+        project_id: i64,
+    ) -> anyhow::Result<ResolvedFeishuAppClient> {
+        let feishu_app_id = sqlx::query_scalar::<_, i64>(
             r#"
-            SELECT app.feishu_app_id, app.app_id, app.encrypted_app_secret,
-                app.encryption_key_id, app.is_active, app.updated_at
-            FROM xingtu_project_feishu_app_binding binding
-            JOIN xingtu_feishu_app app ON app.feishu_app_id = binding.feishu_app_id
-            WHERE binding.project_id = $1
+            SELECT feishu_app_id
+            FROM xingtu_project_feishu_app_binding
+            WHERE project_id = $1
             "#,
         )
         .bind(project_id)
@@ -134,9 +145,60 @@ impl ProjectFeishuAppStore {
         .await
         .with_context(|| format!("读取项目 {project_id} 的飞书应用绑定失败"))?;
 
-        let Some(row) = row else {
-            return Ok(self.default_client.clone());
+        let Some(feishu_app_id) = feishu_app_id else {
+            return Ok(ResolvedFeishuAppClient {
+                client: self.default_client.clone(),
+                feishu_app_id: self.default_database_app_id,
+            });
         };
+        Ok(ResolvedFeishuAppClient {
+            client: self.client_for_feishu_app(feishu_app_id).await?,
+            feishu_app_id: Some(feishu_app_id),
+        })
+    }
+
+    /// 审核通知未配置独立应用时，完整复用项目的数据处理应用。
+    pub async fn resolved_client_for_audit_notice(
+        &self,
+        project_id: i64,
+    ) -> anyhow::Result<ResolvedFeishuAppClient> {
+        let feishu_app_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT feishu_app_id
+            FROM xingtu_project_audit_notice_feishu_app_binding
+            WHERE project_id = $1
+            "#,
+        )
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("读取项目 {project_id} 的审核通知应用绑定失败"))?;
+        let Some(feishu_app_id) = feishu_app_id else {
+            return self.resolved_client_for_project(project_id).await;
+        };
+        Ok(ResolvedFeishuAppClient {
+            client: self.client_for_feishu_app(feishu_app_id).await?,
+            feishu_app_id: Some(feishu_app_id),
+        })
+    }
+
+    pub async fn client_for_feishu_app(&self, feishu_app_id: i64) -> anyhow::Result<LarkClient> {
+        if self.default_database_app_id == Some(feishu_app_id) {
+            return Ok(self.default_client.clone());
+        }
+        let row = sqlx::query(
+            r#"
+            SELECT feishu_app_id, app_id, encrypted_app_secret,
+                encryption_key_id, is_active, updated_at
+            FROM xingtu_feishu_app
+            WHERE feishu_app_id = $1
+            "#,
+        )
+        .bind(feishu_app_id)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("读取飞书应用 {feishu_app_id} 失败"))?
+        .ok_or_else(|| anyhow!("飞书应用不存在：{feishu_app_id}"))?;
         let feishu_app_id: i64 = row.try_get("feishu_app_id")?;
         let app_id: String = row.try_get("app_id")?;
         let encrypted_app_secret: Vec<u8> = row.try_get("encrypted_app_secret")?;
@@ -144,7 +206,7 @@ impl ProjectFeishuAppStore {
         let is_active: bool = row.try_get("is_active")?;
         let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
         if !is_active {
-            return Err(anyhow!("项目 {project_id} 绑定的飞书应用已停用"));
+            return Err(anyhow!("飞书应用已停用：{feishu_app_id}"));
         }
         if encryption_key_id != self.cipher.key_id() {
             return Err(anyhow!(
@@ -299,31 +361,8 @@ impl ProjectFeishuAppStore {
         &self,
         project_id: i64,
     ) -> anyhow::Result<Option<ProjectFeishuAppBinding>> {
-        let row = sqlx::query(
-            r#"
-            SELECT binding.project_id, binding.created_at AS bound_at,
-                binding.updated_at AS binding_updated_at,
-                app.feishu_app_id, app.app_id, app.display_name, app.encryption_key_id,
-                app.is_active, app.created_at, app.updated_at,
-                (SELECT count(*) FROM xingtu_project_feishu_app_binding item
-                 WHERE item.feishu_app_id = app.feishu_app_id) AS project_count
-            FROM xingtu_project_feishu_app_binding binding
-            JOIN xingtu_feishu_app app ON app.feishu_app_id = binding.feishu_app_id
-            WHERE binding.project_id = $1
-            "#,
-        )
-        .bind(project_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|row| {
-            Ok(ProjectFeishuAppBinding {
-                project_id: row.try_get("project_id")?,
-                bound_at: row.try_get("bound_at")?,
-                binding_updated_at: row.try_get("binding_updated_at")?,
-                app: feishu_app_from_row(row)?,
-            })
-        })
-        .transpose()
+        get_project_binding_from_table(&self.pool, project_id, "xingtu_project_feishu_app_binding")
+            .await
     }
 
     pub async fn unbind_project(&self, project_id: i64) -> anyhow::Result<bool> {
@@ -334,6 +373,92 @@ impl ProjectFeishuAppStore {
                 .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    pub async fn bind_audit_notice_project(
+        &self,
+        project_id: i64,
+        feishu_app_id: i64,
+    ) -> anyhow::Result<ProjectFeishuAppBinding> {
+        let mut tx = self.pool.begin().await?;
+        lock_active_app(&mut tx, feishu_app_id).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO xingtu_project_audit_notice_feishu_app_binding
+                (project_id, feishu_app_id)
+            VALUES ($1, $2)
+            ON CONFLICT (project_id) DO UPDATE SET
+                feishu_app_id = EXCLUDED.feishu_app_id, updated_at = now()
+            "#,
+        )
+        .bind(project_id)
+        .bind(feishu_app_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.get_audit_notice_project_binding(project_id)
+            .await?
+            .ok_or_else(|| anyhow!("项目审核通知应用绑定后未能读取"))
+    }
+
+    pub async fn get_audit_notice_project_binding(
+        &self,
+        project_id: i64,
+    ) -> anyhow::Result<Option<ProjectFeishuAppBinding>> {
+        get_project_binding_from_table(
+            &self.pool,
+            project_id,
+            "xingtu_project_audit_notice_feishu_app_binding",
+        )
+        .await
+    }
+
+    pub async fn unbind_audit_notice_project(&self, project_id: i64) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM xingtu_project_audit_notice_feishu_app_binding WHERE project_id = $1",
+        )
+        .bind(project_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+async fn get_project_binding_from_table(
+    pool: &PgPool,
+    project_id: i64,
+    table: &str,
+) -> anyhow::Result<Option<ProjectFeishuAppBinding>> {
+    let sql = format!(
+        r#"
+        SELECT binding.project_id, binding.created_at AS bound_at,
+            binding.updated_at AS binding_updated_at,
+            app.feishu_app_id, app.app_id, app.display_name, app.encryption_key_id,
+            app.is_active, app.created_at, app.updated_at,
+            (SELECT count(DISTINCT project_id) FROM (
+                SELECT project_id FROM xingtu_project_feishu_app_binding
+                WHERE feishu_app_id = app.feishu_app_id
+                UNION
+                SELECT project_id FROM xingtu_project_audit_notice_feishu_app_binding
+                WHERE feishu_app_id = app.feishu_app_id
+            ) projects) AS project_count
+        FROM {table} binding
+        JOIN xingtu_feishu_app app ON app.feishu_app_id = binding.feishu_app_id
+        WHERE binding.project_id = $1
+        "#
+    );
+    let row = sqlx::query(&sql)
+        .bind(project_id)
+        .fetch_optional(pool)
+        .await?;
+    row.map(|row| {
+        Ok(ProjectFeishuAppBinding {
+            project_id: row.try_get("project_id")?,
+            bound_at: row.try_get("bound_at")?,
+            binding_updated_at: row.try_get("binding_updated_at")?,
+            app: feishu_app_from_row(row)?,
+        })
+    })
+    .transpose()
 }
 
 fn configured_default_feishu_app_id() -> anyhow::Result<Option<i64>> {
@@ -437,8 +562,13 @@ fn feishu_app_select_sql() -> &'static str {
     r#"
     SELECT app.feishu_app_id, app.app_id, app.display_name, app.encryption_key_id,
         app.is_active, app.created_at, app.updated_at,
-        (SELECT count(*) FROM xingtu_project_feishu_app_binding binding
-         WHERE binding.feishu_app_id = app.feishu_app_id) AS project_count
+        (SELECT count(DISTINCT project_id) FROM (
+            SELECT project_id FROM xingtu_project_feishu_app_binding
+            WHERE feishu_app_id = app.feishu_app_id
+            UNION
+            SELECT project_id FROM xingtu_project_audit_notice_feishu_app_binding
+            WHERE feishu_app_id = app.feishu_app_id
+        ) projects) AS project_count
     FROM xingtu_feishu_app app
     WHERE ($1::boolean OR app.is_active = true)
     "#
