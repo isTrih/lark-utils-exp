@@ -86,7 +86,7 @@ pub struct LoginAppDto {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AuthorizeRequest {
-    /// 不传表示使用环境变量中的默认飞书应用。
+    /// 不传表示使用 DEFAULT_FEISHU_APP_ID 指定的数据库默认飞书应用。
     pub feishu_app_id: Option<i64>,
     /// 必须与 AUTH_REDIRECT_URIS 中配置的完整地址完全一致。
     pub redirect_uri: String,
@@ -227,9 +227,11 @@ impl LoginService {
     }
 
     pub async fn list_login_apps(&self) -> Result<Vec<LoginAppDto>, ApiError> {
+        let default_app = self.project_apps.default_login_app();
+        let default_database_app_id = self.project_apps.default_database_app_id();
         let mut result = vec![LoginAppDto {
             feishu_app_id: None,
-            display_name: "默认飞书应用".to_owned(),
+            display_name: default_app.display_name,
             is_default: true,
         }];
         let apps = self
@@ -237,11 +239,15 @@ impl LoginService {
             .list(false)
             .await
             .map_err(ApiError::internal)?;
-        result.extend(apps.into_iter().map(|app| LoginAppDto {
-            feishu_app_id: Some(app.feishu_app_id),
-            display_name: app.display_name,
-            is_default: false,
-        }));
+        result.extend(
+            apps.into_iter()
+                .filter(|app| Some(app.feishu_app_id) != default_database_app_id)
+                .map(|app| LoginAppDto {
+                    feishu_app_id: Some(app.feishu_app_id),
+                    display_name: app.display_name,
+                    is_default: false,
+                }),
+        );
         Ok(result)
     }
 

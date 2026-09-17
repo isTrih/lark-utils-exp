@@ -35,7 +35,8 @@ https://api.example.com
 
 ### 飞书登录
 
-1. `GET /api/v1/auth/apps` 获取可选登录应用；`feishu_app_id=null` 表示环境变量中的默认应用。
+1. `GET /api/v1/auth/apps` 获取可选登录应用；`feishu_app_id=null` 表示由环境变量
+   `DEFAULT_FEISHU_APP_ID` 指定的数据库默认应用。
 2. `POST /api/v1/auth/authorize` 传入 `feishu_app_id` 与白名单中的完整 `redirect_uri`，得到
    `authorization_url` 后跳转飞书。
 3. 飞书回调后，将查询参数中的 `code`、`state` 传给 `POST /api/v1/auth/callback`。成功响应
@@ -794,7 +795,8 @@ Content-Type: application/json
 { "feishu_app_id": 2 }
 ```
 
-解除绑定后，该项目恢复使用环境变量 `LARK_APP_ID`、`LARK_APP_SECRET` 对应的全局兜底应用。
+解除绑定后，该项目恢复使用 `DEFAULT_FEISHU_APP_ID` 指定的数据库默认应用。旧部署未配置该变量时，
+才回退使用环境变量 `LARK_APP_ID`、`LARK_APP_SECRET`。
 工作流中的来源 Sheet 导入、主表与审核表同步、审核/错误通知、日报卡片和消息撤回都会按项目
 选择应用。同一飞书应用绑定多个项目时会共用该应用的 tenant access token 缓存。
 

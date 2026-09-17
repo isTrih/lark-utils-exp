@@ -93,8 +93,9 @@ cargo run --bin server
 | 变量 | 必需性 | 说明 |
 | --- | --- | --- |
 | `DATABASE_URL` | 必需 | PostgreSQL 连接串。服务启动时连接数据库并执行 migration。 |
-| `LARK_APP_ID` | 必需 | 全局兜底飞书应用 App ID；未绑定独立应用的项目使用它。 |
-| `LARK_APP_SECRET` | 必需 | 全局兜底飞书应用 App Secret，只能由服务端注入。 |
+| `DEFAULT_FEISHU_APP_ID` | 推荐 | `xingtu_feishu_app` 表中的数字应用 ID。该应用作为默认登录和未绑定项目的兜底应用，凭据直接读取数据库。 |
+| `LARK_APP_ID` | 兼容项 | 仅在未配置 `DEFAULT_FEISHU_APP_ID` 时作为旧部署默认应用。 |
+| `LARK_APP_SECRET` | 兼容项 | 仅与兼容项 `LARK_APP_ID` 配套使用。 |
 | `LARK_BASE_URL` | 可选 | 默认 `https://open.feishu.cn`。 |
 | `SERVER_BIND_ADDR` | 可选 | 默认 `0.0.0.0:8080`。 |
 | `TZ` | 推荐 | Docker 示例使用 `Asia/Shanghai`；业务日期仍由程序显式按北京时间计算。 |

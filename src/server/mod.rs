@@ -13,8 +13,7 @@ pub mod scheduler;
 pub mod secret_store;
 pub mod state;
 
-use crate::client::LarkClient;
-use crate::config::{Config, DatabaseConfig};
+use crate::config::DatabaseConfig;
 use crate::lark::message_history::CardMessageHistoryRepository;
 use crate::lark::project_app::ProjectFeishuAppStore;
 use crate::server::secret_store::{ProjectFeishuCredentialCipher, SessionCipher};
@@ -70,14 +69,10 @@ pub async fn build_app_state() -> anyhow::Result<Arc<AppState>> {
         "启动数据库自检通过：连接、事务、时区、关键表与应用临时状态正常"
     );
 
-    let lark_config = Config::from_env()?;
-    let lark = LarkClient::new(lark_config.clone())?;
-    let project_lark = ProjectFeishuAppStore::new(
-        pool.clone(),
-        ProjectFeishuCredentialCipher::from_env()?,
-        lark_config,
-        lark.clone(),
-    );
+    let project_lark =
+        ProjectFeishuAppStore::from_env(pool.clone(), ProjectFeishuCredentialCipher::from_env()?)
+            .await?;
+    let lark = project_lark.default_client();
     let login = login::LoginService::from_env(pool.clone(), project_lark.clone())?;
     let activity_repo = XingtuActivityConfigRepository::new(pool.clone());
     let data_import_repo = XingtuDataImportRepository::new(pool.clone());

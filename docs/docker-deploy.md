@@ -33,8 +33,10 @@ metadata，例如 `0.2.0+build.20260806T010203Z.git.fa2eb7ca7c9e`。发布脚本
 
 ```bash
 DATABASE_URL=postgres://user:password@host:5432/database
-LARK_APP_ID=cli_xxx
-LARK_APP_SECRET=xxx
+DEFAULT_FEISHU_APP_ID=1
+# 旧部署兼容；未配置 DEFAULT_FEISHU_APP_ID 时才使用：
+# LARK_APP_ID=cli_xxx
+# LARK_APP_SECRET=xxx
 # 飞书 OAuth 登录；回调地址需同时配置到飞书开放平台安全设置。
 AUTH_JWT_SECRET=replace-with-at-least-32-random-bytes
 AUTH_REDIRECT_URIS=["https://dashboard.example.com/login"]
@@ -205,8 +207,7 @@ docker run -d --name lark-utils-exp \
   -e DATA_SYNC_PUBLIC_BASE_URL='https://api.example.com' \
   -e DATA_SYNC_SECRET_KEY='replace-with-the-verification-token' \
   -e DATABASE_URL='postgres://user:password@host:5432/database' \
-  -e LARK_APP_ID='cli_xxx' \
-  -e LARK_APP_SECRET='xxx' \
+  -e DEFAULT_FEISHU_APP_ID='1' \
   -e XINGTU_ACCOUNT_ID='demo-xingtu-account' \
   -e XINGTU_COOKIE='...' \
   -e XINGTU_CSRF_TOKEN='...' \

@@ -4,8 +4,10 @@ use crate::server::secret_store::ProjectFeishuCredentialCipher;
 use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Row, Transaction};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
+
+const DEFAULT_FEISHU_APP_ID_ENV: &str = "DEFAULT_FEISHU_APP_ID";
 
 #[derive(Debug, Clone)]
 pub struct FeishuAppMetadata {
@@ -48,79 +50,75 @@ struct CachedProjectClient {
 pub struct ProjectFeishuAppStore {
     pool: PgPool,
     cipher: ProjectFeishuCredentialCipher,
-    fallback_client: LarkClient,
-    fallback_base_url: String,
-    fallback_app_id: String,
-    fallback_app_secret: String,
+    default_client: LarkClient,
+    default_app: FeishuLoginApp,
+    default_database_app_id: Option<i64>,
+    base_url: String,
     clients: Arc<RwLock<HashMap<i64, CachedProjectClient>>>,
 }
 
 impl ProjectFeishuAppStore {
-    pub fn new(
+    pub async fn from_env(
         pool: PgPool,
         cipher: ProjectFeishuCredentialCipher,
-        fallback_config: Config,
-        fallback_client: LarkClient,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let base_url =
+            env::var("LARK_BASE_URL").unwrap_or_else(|_| "https://open.feishu.cn".to_owned());
+        let default_database_app_id = configured_default_feishu_app_id()?;
+        let default_app = match default_database_app_id {
+            Some(feishu_app_id) => {
+                let mut app = load_database_login_app(&pool, &cipher, feishu_app_id).await?;
+                app.feishu_app_id = None;
+                app.is_default = true;
+                app
+            }
+            None => {
+                let config = Config::from_env()?;
+                FeishuLoginApp {
+                    feishu_app_id: None,
+                    app_id: config.lark_app_id,
+                    app_secret: config.lark_app_secret,
+                    display_name: "默认飞书应用".to_owned(),
+                    is_default: true,
+                }
+            }
+        };
+        let default_client = LarkClient::new(Config {
+            lark_app_id: default_app.app_id.clone(),
+            lark_app_secret: default_app.app_secret.clone(),
+            lark_base_url: base_url.clone(),
+        })?;
+        Ok(Self {
             pool,
             cipher,
-            fallback_client,
-            fallback_base_url: fallback_config.lark_base_url,
-            fallback_app_id: fallback_config.lark_app_id,
-            fallback_app_secret: fallback_config.lark_app_secret,
+            default_client,
+            default_app,
+            default_database_app_id,
+            base_url,
             clients: Arc::new(RwLock::new(HashMap::new())),
-        }
+        })
     }
 
     pub fn default_login_app(&self) -> FeishuLoginApp {
-        FeishuLoginApp {
-            feishu_app_id: None,
-            app_id: self.fallback_app_id.clone(),
-            app_secret: self.fallback_app_secret.clone(),
-            display_name: "默认飞书应用".to_owned(),
-            is_default: true,
-        }
+        self.default_app.clone()
+    }
+
+    pub fn default_client(&self) -> LarkClient {
+        self.default_client.clone()
+    }
+
+    pub fn default_database_app_id(&self) -> Option<i64> {
+        self.default_database_app_id
     }
 
     pub async fn login_app(&self, feishu_app_id: i64) -> anyhow::Result<Option<FeishuLoginApp>> {
-        let row = sqlx::query(
-            r#"
-            SELECT feishu_app_id, app_id, display_name, encrypted_app_secret,
-                encryption_key_id, is_active
-            FROM xingtu_feishu_app
-            WHERE feishu_app_id = $1
-            "#,
-        )
-        .bind(feishu_app_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        if !row.try_get::<bool, _>("is_active")? {
-            return Err(anyhow!("飞书应用已停用：{feishu_app_id}"));
+        if self.default_database_app_id == Some(feishu_app_id) {
+            return Ok(Some(self.default_login_app()));
         }
-        let app_id: String = row.try_get("app_id")?;
-        let encryption_key_id: String = row.try_get("encryption_key_id")?;
-        if encryption_key_id != self.cipher.key_id() {
-            return Err(anyhow!(
-                "飞书应用 {feishu_app_id} 的密钥版本与当前服务不一致"
-            ));
-        }
-        let encrypted: Vec<u8> = row.try_get("encrypted_app_secret")?;
-        Ok(Some(FeishuLoginApp {
-            feishu_app_id: Some(feishu_app_id),
-            app_secret: self
-                .cipher
-                .decrypt_app_secret(feishu_app_id, &app_id, &encrypted)?,
-            app_id,
-            display_name: row.try_get("display_name")?,
-            is_default: false,
-        }))
+        load_optional_database_login_app(&self.pool, &self.cipher, feishu_app_id).await
     }
 
-    /// 项目未绑定应用时使用全局环境变量客户端，保证既有项目平滑升级。
+    /// 项目未绑定应用时使用 DEFAULT_FEISHU_APP_ID 指定的数据库默认客户端。
     pub async fn client_for_project(&self, project_id: i64) -> anyhow::Result<LarkClient> {
         let row = sqlx::query(
             r#"
@@ -137,7 +135,7 @@ impl ProjectFeishuAppStore {
         .with_context(|| format!("读取项目 {project_id} 的飞书应用绑定失败"))?;
 
         let Some(row) = row else {
-            return Ok(self.fallback_client.clone());
+            return Ok(self.default_client.clone());
         };
         let feishu_app_id: i64 = row.try_get("feishu_app_id")?;
         let app_id: String = row.try_get("app_id")?;
@@ -168,7 +166,7 @@ impl ProjectFeishuAppStore {
         let client = LarkClient::new(Config {
             lark_app_id: app_id.clone(),
             lark_app_secret: app_secret,
-            lark_base_url: self.fallback_base_url.clone(),
+            lark_base_url: self.base_url.clone(),
         })
         .with_context(|| format!("创建飞书应用 {feishu_app_id} 的客户端失败"))?;
         self.clients.write().await.insert(
@@ -336,6 +334,73 @@ impl ProjectFeishuAppStore {
                 .await?;
         Ok(result.rows_affected() > 0)
     }
+}
+
+fn configured_default_feishu_app_id() -> anyhow::Result<Option<i64>> {
+    let Some(value) = env::var(DEFAULT_FEISHU_APP_ID_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let feishu_app_id = value
+        .parse::<i64>()
+        .map_err(|_| anyhow!("DEFAULT_FEISHU_APP_ID 必须是数据库中的正整数应用 ID"))?;
+    if feishu_app_id <= 0 {
+        return Err(anyhow!(
+            "DEFAULT_FEISHU_APP_ID 必须是数据库中的正整数应用 ID"
+        ));
+    }
+    Ok(Some(feishu_app_id))
+}
+
+async fn load_optional_database_login_app(
+    pool: &PgPool,
+    cipher: &ProjectFeishuCredentialCipher,
+    feishu_app_id: i64,
+) -> anyhow::Result<Option<FeishuLoginApp>> {
+    let row = sqlx::query(
+        r#"
+        SELECT app_id, display_name, encrypted_app_secret, encryption_key_id, is_active
+        FROM xingtu_feishu_app
+        WHERE feishu_app_id = $1
+        "#,
+    )
+    .bind(feishu_app_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if !row.try_get::<bool, _>("is_active")? {
+        return Err(anyhow!("飞书应用已停用：{feishu_app_id}"));
+    }
+    let app_id: String = row.try_get("app_id")?;
+    let encryption_key_id: String = row.try_get("encryption_key_id")?;
+    if encryption_key_id != cipher.key_id() {
+        return Err(anyhow!(
+            "飞书应用 {feishu_app_id} 的密钥版本与当前服务不一致"
+        ));
+    }
+    let encrypted: Vec<u8> = row.try_get("encrypted_app_secret")?;
+    Ok(Some(FeishuLoginApp {
+        feishu_app_id: Some(feishu_app_id),
+        app_secret: cipher.decrypt_app_secret(feishu_app_id, &app_id, &encrypted)?,
+        app_id,
+        display_name: row.try_get("display_name")?,
+        is_default: false,
+    }))
+}
+
+async fn load_database_login_app(
+    pool: &PgPool,
+    cipher: &ProjectFeishuCredentialCipher,
+    feishu_app_id: i64,
+) -> anyhow::Result<FeishuLoginApp> {
+    load_optional_database_login_app(pool, cipher, feishu_app_id)
+        .await?
+        .ok_or_else(|| anyhow!("DEFAULT_FEISHU_APP_ID 指向的飞书应用不存在：{feishu_app_id}"))
 }
 
 fn validate_input<'a>(
