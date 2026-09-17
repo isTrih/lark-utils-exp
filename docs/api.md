@@ -43,6 +43,19 @@ https://api.example.com
    包含有效期 7 天的 JWT、头像、union ID、open ID、用户名及项目权限。
 4. `GET /api/v1/auth/me` 校验并返回当前会话；`POST /api/v1/auth/logout` 立即撤销 JWT。
 
+非默认应用也可以使用默认管理员生成的长期应用 Token 登录：
+
+```http
+POST /api/v1/auth/app-token
+Content-Type: application/json
+
+{ "token": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }
+```
+
+成功后同样返回有效期 7 天的 JWT。`sk-...` 应用 Token 本身不自动过期，只有管理员轮换或撤销
+后才失效；它只能获得所属非默认应用在 `xingtu_feishu_app_project_access` 中配置的项目权限，
+不能获得默认应用的全局管理员权限。
+
 服务端仅使用飞书 `user_access_token` 获取一次基础用户信息，不保存该 Token，也不申请文档、
 通讯录或消息权限。飞书应用需要将看板 `/login` 完整地址加入重定向 URL 白名单。
 
@@ -62,6 +75,16 @@ Content-Type: application/json
 ```
 
 `can_manage=true` 必须同时 `can_view=true`。权限每次请求实时读取，修改后对已有 JWT 立即生效。
+
+默认管理员通过 `/api/v1/admin/feishu/apps/{feishu_app_id}/login-token` 管理应用 Token：
+
+- `GET`：查询是否已配置、是否有效、脱敏前缀、备注和最后使用时间，不返回明文。
+- `PUT`：生成或轮换 Token，请求体为 `{ "remark": "上海运营团队" }`；明文只返回一次。
+- `PATCH`：只修改备注，传 `null` 或空字符串可清空。
+- `DELETE`：撤销 Token，使其不能再换取新的 JWT。
+
+服务端数据库只保存 Token 的 SHA-256 摘要和脱敏前缀，不保存可还原的明文。轮换会立即使旧
+`sk-...` Token 失效；已签发 JWT 仍按七天有效期运行，且继续受实时项目权限约束。
 
 飞书连接器外，旧写接口曾统一要求 `Authorization: Bearer <MUTATION_API_TOKEN>`；未配置时兼容
 回退到 `ADMIN_API_TOKEN`。唯一例外是 `POST /api/v1/xingtu/sessions`：内部浏览器插件可使用

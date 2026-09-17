@@ -6,9 +6,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use salvo::http::header::{CACHE_CONTROL, HeaderValue, PRAGMA};
 use salvo::oapi::ToSchema;
 use salvo::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::collections::HashSet;
 use std::env;
@@ -123,6 +125,33 @@ pub struct LoginResponse {
     pub feishu_app_id: Option<i64>,
     pub user: LoginUserDto,
     pub project_permissions: Vec<ProjectPermission>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppTokenLoginRequest {
+    /// 默认管理员为非默认飞书应用生成的长期 `sk-...` Token。
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AppLoginTokenDto {
+    pub configured: bool,
+    pub is_active: bool,
+    /// 脱敏前缀，仅用于区分 Token，不能用于登录。
+    pub token_prefix: Option<String>,
+    pub remark: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RotatedAppLoginTokenDto {
+    #[serde(flatten)]
+    pub status: AppLoginTokenDto,
+    /// 只在本次生成/轮换响应中返回一次，请立即安全保存。
+    pub token: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -304,6 +333,23 @@ impl LoginService {
         if user.union_id.trim().is_empty() {
             return Err(ApiError::bad_gateway("飞书没有返回 union_id"));
         }
+        self.issue_session(
+            &app,
+            LoginUserDto {
+                union_id: user.union_id,
+                open_id: user.open_id,
+                name: user.name,
+                avatar_url: user.avatar_url,
+            },
+        )
+        .await
+    }
+
+    async fn issue_session(
+        &self,
+        app: &FeishuLoginApp,
+        user: LoginUserDto,
+    ) -> Result<LoginResponse, ApiError> {
         let issued_at = Utc::now();
         let expires_at = issued_at + Duration::days(SESSION_LIFETIME_DAYS);
         let session_id = random_token(32)?;
@@ -350,14 +396,173 @@ impl LoginService {
             expires_at,
             is_default_app: app.is_default,
             feishu_app_id: app.feishu_app_id,
-            user: LoginUserDto {
-                union_id: user.union_id,
-                open_id: user.open_id,
-                name: user.name,
-                avatar_url: user.avatar_url,
-            },
+            user,
             project_permissions,
         })
+    }
+
+    pub async fn login_with_app_token(
+        &self,
+        request: AppTokenLoginRequest,
+    ) -> Result<LoginResponse, ApiError> {
+        let token = normalize_app_token(&request.token)?;
+        let token_hash = app_token_hash(token);
+        let row = sqlx::query(
+            r#"
+            UPDATE xingtu_feishu_app_login_token login_token
+            SET last_used_at = now()
+            FROM xingtu_feishu_app app
+            WHERE login_token.token_hash = $1
+                AND login_token.is_active = true
+                AND app.feishu_app_id = login_token.feishu_app_id
+                AND app.is_active = true
+            RETURNING app.feishu_app_id, app.display_name
+            "#,
+        )
+        .bind(token_hash.as_slice())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| ApiError::forbidden("应用 Token 无效或已撤销"))?;
+        let feishu_app_id: i64 = row.try_get("feishu_app_id")?;
+        if self.project_apps.default_database_app_id() == Some(feishu_app_id) {
+            return Err(ApiError::forbidden("默认飞书应用不能使用应用 Token 登录"));
+        }
+        let display_name: String = row.try_get("display_name")?;
+        let app = self
+            .project_apps
+            .login_app(feishu_app_id)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::forbidden("应用 Token 对应的飞书应用不可用"))?;
+        let identity = format!("app-token:{feishu_app_id}");
+        self.issue_session(
+            &FeishuLoginApp {
+                is_default: false,
+                ..app
+            },
+            LoginUserDto {
+                union_id: identity.clone(),
+                open_id: identity,
+                name: format!("{display_name}（应用 Token）"),
+                avatar_url: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn app_login_token_status(
+        &self,
+        feishu_app_id: i64,
+    ) -> Result<AppLoginTokenDto, ApiError> {
+        self.ensure_non_default_app(feishu_app_id).await?;
+        let row = sqlx::query(
+            r#"
+            SELECT token_prefix, remark, is_active, created_at, updated_at, last_used_at
+            FROM xingtu_feishu_app_login_token
+            WHERE feishu_app_id = $1
+            "#,
+        )
+        .bind(feishu_app_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(app_login_token_from_row)
+            .unwrap_or_else(|| AppLoginTokenDto {
+                configured: false,
+                is_active: false,
+                token_prefix: None,
+                remark: None,
+                created_at: None,
+                updated_at: None,
+                last_used_at: None,
+            }))
+    }
+
+    pub async fn rotate_app_login_token(
+        &self,
+        feishu_app_id: i64,
+        remark: Option<String>,
+    ) -> Result<RotatedAppLoginTokenDto, ApiError> {
+        self.ensure_non_default_app(feishu_app_id).await?;
+        let token = format!("sk-{}", random_token(32)?);
+        let token_hash = app_token_hash(&token);
+        let prefix = token.chars().take(11).collect::<String>();
+        let remark = normalize_remark(remark)?;
+        let row = sqlx::query(
+            r#"
+            INSERT INTO xingtu_feishu_app_login_token (
+                feishu_app_id, token_hash, token_prefix, remark, is_active
+            ) VALUES ($1, $2, $3, $4, true)
+            ON CONFLICT (feishu_app_id) DO UPDATE SET
+                token_hash = EXCLUDED.token_hash,
+                token_prefix = EXCLUDED.token_prefix,
+                remark = EXCLUDED.remark,
+                is_active = true,
+                last_used_at = NULL
+            RETURNING token_prefix, remark, is_active, created_at, updated_at, last_used_at
+            "#,
+        )
+        .bind(feishu_app_id)
+        .bind(token_hash.as_slice())
+        .bind(prefix)
+        .bind(remark)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(RotatedAppLoginTokenDto {
+            status: app_login_token_from_row(row),
+            token,
+        })
+    }
+
+    pub async fn update_app_login_token_remark(
+        &self,
+        feishu_app_id: i64,
+        remark: Option<String>,
+    ) -> Result<AppLoginTokenDto, ApiError> {
+        self.ensure_non_default_app(feishu_app_id).await?;
+        let remark = normalize_remark(remark)?;
+        let row = sqlx::query(
+            r#"
+            UPDATE xingtu_feishu_app_login_token SET remark = $2
+            WHERE feishu_app_id = $1
+            RETURNING token_prefix, remark, is_active, created_at, updated_at, last_used_at
+            "#,
+        )
+        .bind(feishu_app_id)
+        .bind(remark)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("该应用尚未生成登录 Token"))?;
+        Ok(app_login_token_from_row(row))
+    }
+
+    pub async fn revoke_app_login_token(&self, feishu_app_id: i64) -> Result<(), ApiError> {
+        self.ensure_non_default_app(feishu_app_id).await?;
+        let result = sqlx::query(
+            "UPDATE xingtu_feishu_app_login_token SET is_active = false WHERE feishu_app_id = $1",
+        )
+        .bind(feishu_app_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::not_found("该应用尚未生成登录 Token"));
+        }
+        Ok(())
+    }
+
+    async fn ensure_non_default_app(&self, feishu_app_id: i64) -> Result<(), ApiError> {
+        if feishu_app_id <= 0 {
+            return Err(ApiError::bad_request("feishu_app_id 必须大于 0"));
+        }
+        if self.project_apps.default_database_app_id() == Some(feishu_app_id) {
+            return Err(ApiError::bad_request("默认飞书应用不能配置应用 Token"));
+        }
+        self.project_apps
+            .get(feishu_app_id)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("飞书应用不存在"))?;
+        Ok(())
     }
 
     fn decode_state(&self, state: &str) -> Result<LoginStateClaims, ApiError> {
@@ -522,6 +727,7 @@ pub fn routes() -> Router {
         .push(Router::with_path("apps").get(list_login_apps))
         .push(Router::with_path("authorize").post(authorize))
         .push(Router::with_path("callback").post(callback))
+        .push(Router::with_path("app-token").post(login_with_app_token))
         .push(
             Router::with_path("me")
                 .hoop(crate::server::auth::require_data_access)
@@ -556,6 +762,28 @@ async fn callback(
 ) -> ApiResult<LoginResponse> {
     let state = state_from_depot(depot)?;
     Ok(Json(state.login.callback(body.into_inner()).await?))
+}
+
+#[endpoint(
+    tags("auth"),
+    summary = "使用非默认应用的长期 Token 登录",
+    description = "校验默认管理员为非默认飞书应用生成的 sk-... Token，并签发有效期七天的 JWT。应用 Token 本身不会自动过期，只有轮换或撤销后失效；JWT 权限实时读取该应用的项目访问配置。"
+)]
+async fn login_with_app_token(
+    body: RequiredJsonBody<AppTokenLoginRequest>,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> ApiResult<LoginResponse> {
+    let state = state_from_depot(depot)?;
+    res.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    res.headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    Ok(Json(
+        state.login.login_with_app_token(body.into_inner()).await?,
+    ))
 }
 
 #[endpoint(tags("auth"), summary = "查询当前登录用户和项目权限")]
@@ -622,6 +850,43 @@ fn random_token(length: usize) -> Result<String, ApiError> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+fn normalize_app_token(value: &str) -> Result<&str, ApiError> {
+    let value = value.trim().strip_prefix("Bearer ").unwrap_or(value.trim());
+    if !value.starts_with("sk-") || value.len() < 32 || value.len() > 128 {
+        return Err(ApiError::forbidden("应用 Token 无效或已撤销"));
+    }
+    Ok(value)
+}
+
+fn app_token_hash(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+fn normalize_remark(value: Option<String>) -> Result<Option<String>, ApiError> {
+    let value = value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if value
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 200)
+    {
+        return Err(ApiError::bad_request("Token 备注不能超过 200 个字符"));
+    }
+    Ok(value)
+}
+
+fn app_login_token_from_row(row: sqlx::postgres::PgRow) -> AppLoginTokenDto {
+    AppLoginTokenDto {
+        configured: true,
+        is_active: row.get("is_active"),
+        token_prefix: row.get("token_prefix"),
+        remark: row.get("remark"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        last_used_at: row.get("last_used_at"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +915,34 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(json, comma);
+    }
+
+    #[test]
+    fn app_token_validation_and_hashing_are_stable() {
+        let token = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+        assert_eq!(normalize_app_token(token).unwrap(), token);
+        assert_eq!(app_token_hash(token), app_token_hash(token));
+        assert_ne!(
+            app_token_hash(token),
+            app_token_hash("sk-another-valid-token-0123456789")
+        );
+        assert!(normalize_app_token("ordinary-jwt").is_err());
+    }
+
+    #[test]
+    fn app_token_remark_is_trimmed_and_limited() {
+        assert_eq!(
+            normalize_remark(Some("  上海团队  ".into())).unwrap(),
+            Some("上海团队".into())
+        );
+        assert_eq!(normalize_remark(Some("  ".into())).unwrap(), None);
+        assert!(normalize_remark(Some("x".repeat(201))).is_err());
+    }
+
+    #[test]
+    fn app_token_login_endpoint_is_in_openapi() {
+        let openapi =
+            salvo::oapi::OpenApi::new("test", "1.0.0").merge_router_with_base(&routes(), "/api/v1");
+        assert!(openapi.paths.contains_key("/api/v1/auth/app-token"));
     }
 }

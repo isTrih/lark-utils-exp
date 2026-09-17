@@ -1,6 +1,6 @@
 [package]
 name = "lark-exp"
-version = "3.2.1"
+version = "3.3.0"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
@@ -37,6 +37,7 @@ salvo = { version = "0.89.0", features = ["logging", "affix-state", "oapi", "cor
 serde =  { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha1 = "0.10.6"
+sha2 = "0.10.9"
 zstd = "0.13.3"
 
 # PostgreSQL 数据库访问

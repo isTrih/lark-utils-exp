@@ -1689,7 +1689,7 @@ dependencies = [
 
 [[package]]
 name = "lark-exp"
-version = "3.2.1"
+version = "3.3.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1709,6 +1709,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "sqlx",
  "tokio",
  "tracing",

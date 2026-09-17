@@ -10,6 +10,7 @@ use crate::server::auth::{
     require_project_route_access,
 };
 use crate::server::error::{ApiError, ApiResult};
+use crate::server::login::{AppLoginTokenDto, RotatedAppLoginTokenDto};
 use crate::server::state::state_from_depot;
 use crate::workflow::XingtuWorkflowService;
 use crate::workflow_run::{WorkflowRunRecord, WorkflowStepRecord};
@@ -116,6 +117,14 @@ pub fn routes() -> Router {
                 .hoop(require_default_actor)
                 .get(list_feishu_app_project_access)
                 .put(replace_feishu_app_project_access),
+        )
+        .push(
+            Router::with_path("feishu/apps/{feishu_app_id}/login-token")
+                .hoop(require_default_actor)
+                .get(get_feishu_app_login_token)
+                .put(rotate_feishu_app_login_token)
+                .patch(update_feishu_app_login_token)
+                .delete(revoke_feishu_app_login_token),
         )
         .push(
             Router::with_path("projects/{project_id}/accounts")
@@ -588,6 +597,13 @@ struct FeishuAppProjectAccessInput {
     can_manage: bool,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct SaveFeishuAppLoginTokenRequest {
+    /// Token 的用途或分发对象备注；传 null 或空字符串表示清空。
+    remark: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct CreateMasterProjectRequest {
@@ -941,6 +957,81 @@ async fn replace_feishu_app_project_access(
     Ok(Json(
         fetch_feishu_app_project_access(&state.pool, path.feishu_app_id).await?,
     ))
+}
+
+#[endpoint(
+    tags("admin"),
+    summary = "查询非默认飞书应用的长期登录 Token 状态",
+    description = "仅返回脱敏前缀、备注和使用时间，不返回 Token 明文。应用 Token 不会自动过期，只有轮换或撤销后失效。"
+)]
+async fn get_feishu_app_login_token(
+    path: FeishuAppPath,
+    depot: &mut Depot,
+) -> ApiResult<AppLoginTokenDto> {
+    let state = state_from_depot(depot)?;
+    Ok(Json(
+        state
+            .login
+            .app_login_token_status(path.feishu_app_id)
+            .await?,
+    ))
+}
+
+#[endpoint(
+    tags("admin"),
+    summary = "生成或轮换非默认飞书应用的长期登录 Token",
+    description = "生成新的 sk-... Token。明文只在本次响应返回一次；服务端只保存 SHA-256 摘要。Token 不会自动过期，轮换后旧 Token 立即失效。"
+)]
+async fn rotate_feishu_app_login_token(
+    path: FeishuAppPath,
+    body: RequiredJsonBody<SaveFeishuAppLoginTokenRequest>,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> ApiResult<RotatedAppLoginTokenDto> {
+    let state = state_from_depot(depot)?;
+    prevent_secret_response_cache(res);
+    Ok(Json(
+        state
+            .login
+            .rotate_app_login_token(path.feishu_app_id, body.into_inner().remark)
+            .await?,
+    ))
+}
+
+#[endpoint(
+    tags("admin"),
+    summary = "修改非默认飞书应用登录 Token 的备注",
+    description = "只修改备注，不轮换 Token。传 null 或空字符串可清空备注。"
+)]
+async fn update_feishu_app_login_token(
+    path: FeishuAppPath,
+    body: RequiredJsonBody<SaveFeishuAppLoginTokenRequest>,
+    depot: &mut Depot,
+) -> ApiResult<AppLoginTokenDto> {
+    let state = state_from_depot(depot)?;
+    Ok(Json(
+        state
+            .login
+            .update_app_login_token_remark(path.feishu_app_id, body.into_inner().remark)
+            .await?,
+    ))
+}
+
+#[endpoint(
+    tags("admin"),
+    summary = "撤销非默认飞书应用的长期登录 Token",
+    description = "撤销后该 sk-... Token 不能再创建新登录会话；已经签发的 JWT 仍按自身有效期和实时项目权限工作。"
+)]
+async fn revoke_feishu_app_login_token(
+    path: FeishuAppPath,
+    depot: &mut Depot,
+) -> ApiResult<serde_json::Value> {
+    let state = state_from_depot(depot)?;
+    state
+        .login
+        .revoke_app_login_token(path.feishu_app_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 #[endpoint(tags("admin"), summary = "更新主项目")]
@@ -2966,6 +3057,15 @@ fn default_true() -> bool {
     true
 }
 
+fn prevent_secret_response_cache(res: &mut Response) {
+    res.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    res.headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3035,6 +3135,7 @@ mod tests {
             "/api/v1/admin/feishu/bitable/tables",
             "/api/v1/admin/feishu/apps",
             "/api/v1/admin/feishu/apps/{feishu_app_id}",
+            "/api/v1/admin/feishu/apps/{feishu_app_id}/login-token",
             "/api/v1/admin/projects",
             "/api/v1/admin/projects/{project_id}",
             "/api/v1/admin/projects/{project_id}/notification",
