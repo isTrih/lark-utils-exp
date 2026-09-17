@@ -140,6 +140,7 @@ pub fn routes() -> Router {
 }
 
 #[derive(Debug, Deserialize, ToParameters)]
+#[salvo(parameters(default_parameter_in = Path))]
 struct QueryProjectPath {
     project_id: i64,
 }
@@ -1268,6 +1269,27 @@ mod tests {
         )
     }
 
+    #[endpoint]
+    async fn query_project_path_probe(path: QueryProjectPath) -> Json<Value> {
+        Json(json!({ "project_id": path.project_id }))
+    }
+
+    #[tokio::test]
+    async fn project_workflow_path_extracts_project_id_from_route() {
+        let service = Service::new(
+            Router::with_path("api/v1/queries/projects/{project_id}/workflows/today")
+                .get(query_project_path_probe),
+        );
+        let mut response =
+            TestClient::get("http://127.0.0.1/api/v1/queries/projects/6/workflows/today")
+                .send(&service)
+                .await;
+
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        let body = response.take_json::<Value>().await.unwrap();
+        assert_eq!(body["project_id"], 6);
+    }
+
     #[test]
     fn workflow_scope_accepts_only_positive_activity_period_ids() {
         assert_eq!(validate_activity_period_id(None).unwrap(), None);
@@ -1317,6 +1339,19 @@ mod tests {
                 operation["responses"].get(status).is_some(),
                 "audit-extra response {status} is undocumented"
             );
+        }
+        for path in [
+            "api/v1/queries/projects/{project_id}/workflows/today",
+            "api/v1/queries/projects/{project_id}/workflows/latest",
+        ] {
+            let parameters = document_value["paths"][path]["get"]["parameters"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{path} 缺少路径参数文档"));
+            assert!(parameters.iter().any(|parameter| {
+                parameter["name"] == "project_id"
+                    && parameter["in"] == "path"
+                    && parameter["required"] == true
+            }));
         }
         let document = serde_json::to_string(&document_value).unwrap();
         for expected in [
