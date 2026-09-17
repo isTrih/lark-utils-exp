@@ -41,7 +41,7 @@ struct FormattingSummary {
 #[endpoint(
     tags("admin"),
     summary = "格式化电子表格分析文本",
-    description = "从飞书普通电子表格链接提取 spreadsheetToken 和 sheet_id，以 sheet_id 读取单个范围；将“数字）文字：”加粗，将下降百分比标绿、上升百分比标红，绝对数字大于 50 时加粗。只回写命中的字符串单元格。"
+    description = "从飞书普通电子表格链接提取 spreadsheetToken 和 sheet_id，以 sheet_id 读取单个范围；将“数字）文字：”加粗，将下降百分比标绿、上升百分比标红，绝对数字大于 50 时加粗。只回写命中的字符串单元格。默认应用管理员可省略 project_id；非默认应用必须指定拥有配置权限的 project_id，并使用该项目绑定的飞书应用读写。"
 )]
 async fn format_analysis_spreadsheet(
     body: RequiredJsonBody<FormatAnalysisSpreadsheetRequest>,
@@ -50,6 +50,7 @@ async fn format_analysis_spreadsheet(
 ) -> ApiResult<Value> {
     prevent_response_caching(res);
     let body = body.into_inner();
+    crate::server::auth::require_optional_project_manage(depot, body.project_id)?;
     let location = parse_spreadsheet_location(&body.url)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let state = state_from_depot(depot)?;

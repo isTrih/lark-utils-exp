@@ -214,6 +214,26 @@ pub fn require_project_manage(
     }
 }
 
+/// 校验可选的项目管理范围。
+///
+/// 默认应用管理员可以省略项目 ID 并使用默认飞书应用；非默认应用必须明确指定项目，
+/// 且拥有该项目的配置权限，避免借用默认应用访问不属于自己的飞书资源。
+pub fn require_optional_project_manage(
+    depot: &Depot,
+    project_id: Option<i64>,
+) -> Result<(), crate::server::error::ApiError> {
+    match project_id {
+        Some(project_id) if project_id <= 0 => Err(crate::server::error::ApiError::bad_request(
+            "project_id 必须大于 0",
+        )),
+        Some(project_id) => require_project_manage(depot, project_id),
+        None if actor_from_depot(depot)?.is_default_admin() => Ok(()),
+        None => Err(crate::server::error::ApiError::forbidden(
+            "非默认应用执行该操作时必须指定已获配置权限的 project_id",
+        )),
+    }
+}
+
 pub fn require_global_query(depot: &Depot) -> Result<(), crate::server::error::ApiError> {
     if actor_from_depot(depot)?.can_query_all() {
         Ok(())
@@ -626,6 +646,30 @@ mod tests {
         assert!(!actor.can_manage_project(10));
         assert!(!actor.can_view_project(11));
         assert_eq!(actor.visible_project_ids(), Some(vec![10]));
+    }
+
+    #[test]
+    fn optional_project_manage_requires_scope_for_non_default_apps() {
+        let mut default_depot = Depot::new();
+        default_depot.insert(AUTH_ACTOR_DEPOT_KEY, login_actor(true, Vec::new()));
+        assert!(require_optional_project_manage(&default_depot, None).is_ok());
+
+        let mut scoped_depot = Depot::new();
+        scoped_depot.insert(
+            AUTH_ACTOR_DEPOT_KEY,
+            login_actor(
+                false,
+                vec![crate::server::login::ProjectPermission {
+                    project_id: 10,
+                    can_view: true,
+                    can_manage: true,
+                }],
+            ),
+        );
+        assert!(require_optional_project_manage(&scoped_depot, Some(10)).is_ok());
+        assert!(require_optional_project_manage(&scoped_depot, None).is_err());
+        assert!(require_optional_project_manage(&scoped_depot, Some(11)).is_err());
+        assert!(require_optional_project_manage(&scoped_depot, Some(0)).is_err());
     }
 
     #[tokio::test]

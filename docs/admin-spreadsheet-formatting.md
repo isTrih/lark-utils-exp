@@ -4,7 +4,7 @@
 
 ```http
 POST /api/v1/admin/feishu/spreadsheets/format-analysis
-Authorization: Bearer <MUTATION_API_TOKEN>
+Authorization: Bearer <JWT 或 MUTATION_API_TOKEN>
 Content-Type: application/json
 ```
 
@@ -12,11 +12,13 @@ Content-Type: application/json
 
 ```json
 {
+  "project_id": 1,
   "url": "https://example.feishu.cn/wiki/ExampleSpreadsheetToken?sheet=Sheet01",
   "dry_run": false
 }
 ```
 
+- `project_id`：默认应用管理员可省略；非默认应用必须填写，并且当前登录应用必须拥有该项目的配置权限。填写后使用项目绑定的飞书应用读写表格。
 - `url`：必填。支持 `/sheets/{spreadsheet_token}?sheet={sheet_id}`、`/wiki/{spreadsheet_token}?sheet={sheet_id}`，也支持 Markdown 链接字符串。
 - `dry_run`：可选，默认 `false`。设为 `true` 时只读取和统计，不修改电子表格。
 
@@ -27,6 +29,7 @@ curl -X POST 'https://api.example.com/api/v1/admin/feishu/spreadsheets/format-an
   -H 'Authorization: Bearer <MUTATION_API_TOKEN>' \
   -H 'Content-Type: application/json' \
   -d '{
+    "project_id": 1,
     "url": "https://example.feishu.cn/wiki/ExampleSpreadsheetToken?sheet=Sheet01",
     "dry_run": true
   }'

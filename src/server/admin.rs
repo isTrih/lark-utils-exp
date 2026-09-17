@@ -203,22 +203,14 @@ pub fn routes() -> Router {
                 .hoop(require_default_actor)
                 .get(get_xingtu_session_upload_token),
         )
-        .push(crate::server::admin_sheet::routes().hoop(require_default_actor))
+        .push(crate::server::admin_sheet::routes())
         .push(
             Router::with_path("feishu/bitable/tables")
                 .hoop(require_default_actor)
                 .get(list_bitable_tables),
         )
-        .push(
-            Router::with_path("feishu/chats")
-                .hoop(require_default_actor)
-                .get(list_bot_chats),
-        )
-        .push(
-            Router::with_path("feishu/chats/{chat_id}/members")
-                .hoop(require_default_actor)
-                .get(list_chat_members),
-        )
+        .push(Router::with_path("feishu/chats").get(list_bot_chats))
+        .push(Router::with_path("feishu/chats/{chat_id}/members").get(list_chat_members))
 }
 
 #[derive(Debug, Deserialize, Serialize, ToParameters, ToSchema)]
@@ -1996,7 +1988,7 @@ async fn normalize_live_sessions(
 #[endpoint(
     tags("admin"),
     summary = "查询机器人所在的群聊",
-    description = "以应用身份调用飞书群列表接口，并透传飞书官方 code/data/msg 响应和 HTTP 状态码。"
+    description = "以应用身份调用飞书群列表接口，并透传飞书官方 code/data/msg 响应和 HTTP 状态码。默认应用管理员可省略 project_id；非默认应用必须指定拥有配置权限的 project_id，并使用该项目绑定的飞书应用。"
 )]
 async fn list_bot_chats(
     query: FeishuChatListQuery,
@@ -2004,6 +1996,7 @@ async fn list_bot_chats(
     res: &mut Response,
 ) -> ApiResult<serde_json::Value> {
     let project_id = query.project_id;
+    crate::server::auth::require_optional_project_manage(depot, project_id)?;
     let query = build_chat_list_query(query)?;
     let state = state_from_depot(depot)?;
     let lark = admin_lark_client(&state.workflow, project_id).await?;
@@ -2041,7 +2034,7 @@ async fn list_bitable_tables(
 #[endpoint(
     tags("admin"),
     summary = "查询指定群聊的成员",
-    description = "以应用身份调用飞书群成员接口；member_id_type 支持 open_id、union_id、user_id，并透传飞书官方响应。"
+    description = "以应用身份调用飞书群成员接口；member_id_type 支持 open_id、union_id、user_id，并透传飞书官方响应。默认应用管理员可省略 project_id；非默认应用必须指定拥有配置权限的 project_id，并使用该项目绑定的飞书应用。"
 )]
 async fn list_chat_members(
     path: FeishuChatPath,
@@ -2051,6 +2044,7 @@ async fn list_chat_members(
 ) -> ApiResult<serde_json::Value> {
     let chat_id = validate_feishu_chat_id(&path.chat_id)?;
     let project_id = query.project_id;
+    crate::server::auth::require_optional_project_manage(depot, project_id)?;
     let query = build_chat_members_query(query)?;
     let state = state_from_depot(depot)?;
     let lark = admin_lark_client(&state.workflow, project_id).await?;

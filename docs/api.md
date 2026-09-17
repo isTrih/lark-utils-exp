@@ -698,20 +698,22 @@ GET /api/v1/admin/feishu/chats
 GET /api/v1/admin/feishu/chats/{chat_id}/members
 ```
 
-两个接口使用服务端配置的飞书应用身份和 tenant access token；调用方只提供本系统的管理员
-Bearer Token，不传飞书 Token。响应会保留飞书官方的 HTTP 状态码以及完整 `code/data/msg`
+两个接口使用服务端配置的飞书应用身份和 tenant access token；调用方只提供本系统的登录 JWT
+或管理员 Bearer Token，不传飞书 Token。默认应用管理员可省略 `project_id`；非默认应用必须传入
+拥有配置权限的 `project_id`，服务端会使用该项目绑定的飞书应用。响应会保留飞书官方的 HTTP 状态码以及完整 `code/data/msg`
 JSON 信封，不转换成项目自己的列表结构。每次请求只代理一页，下一页继续传入响应中的
 `page_token`，避免自动聚合改变官方分页语义。
 
 查询机器人所在群聊：
 
 ```bash
-curl "https://api.example.com/api/v1/admin/feishu/chats?user_id_type=union_id&sort_type=ByActiveTimeDesc&page_size=100" \
+curl "https://api.example.com/api/v1/admin/feishu/chats?project_id=1&user_id_type=union_id&sort_type=ByActiveTimeDesc&page_size=100" \
   -H "Authorization: Bearer $MUTATION_API_TOKEN"
 ```
 
 | 参数 | 可选值/范围 | 说明 |
 | --- | --- | --- |
+| `project_id` | 正整数 | 默认应用管理员可省略；非默认应用必填且须拥有配置权限 |
 | `user_id_type` | `open_id`、`union_id`、`user_id` | 返回群主 ID 的类型；不传时使用飞书默认值 |
 | `sort_type` | `ByCreateTimeAsc`、`ByActiveTimeDesc` | 创建时间升序或活跃时间降序 |
 | `page_size` | 1..100 | 飞书默认 20 |
@@ -720,7 +722,7 @@ curl "https://api.example.com/api/v1/admin/feishu/chats?user_id_type=union_id&so
 查询指定群聊成员：
 
 ```bash
-curl "https://api.example.com/api/v1/admin/feishu/chats/oc_xxxxxxxxxxxxxxxx/members?member_id_type=union_id&page_size=100" \
+curl "https://api.example.com/api/v1/admin/feishu/chats/oc_xxxxxxxxxxxxxxxx/members?project_id=1&member_id_type=union_id&page_size=100" \
   -H "Authorization: Bearer $MUTATION_API_TOKEN"
 ```
 
