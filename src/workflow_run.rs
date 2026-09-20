@@ -370,16 +370,19 @@ impl WorkflowRunRepository {
     pub async fn list_project_runs_today(
         &self,
         project_id: i64,
+        activity_period_id: Option<i64>,
     ) -> anyhow::Result<Vec<ProjectWorkflowRunRecord>> {
-        self.list_project_runs(project_id, true, 1_000).await
+        self.list_project_runs(project_id, activity_period_id, true, 1_000)
+            .await
     }
 
     pub async fn latest_project_run(
         &self,
         project_id: i64,
+        activity_period_id: Option<i64>,
     ) -> anyhow::Result<Option<ProjectWorkflowRunRecord>> {
         Ok(self
-            .list_project_runs(project_id, false, 1)
+            .list_project_runs(project_id, activity_period_id, false, 1)
             .await?
             .into_iter()
             .next())
@@ -388,6 +391,7 @@ impl WorkflowRunRepository {
     async fn list_project_runs(
         &self,
         project_id: i64,
+        activity_period_id: Option<i64>,
         today_only: bool,
         limit: i64,
     ) -> anyhow::Result<Vec<ProjectWorkflowRunRecord>> {
@@ -404,28 +408,36 @@ impl WorkflowRunRepository {
                         JOIN xingtu_activity_period period
                             ON period.activity_period_id = step.activity_period_id
                         WHERE step.workflow_run_id = run.workflow_run_id
-                            AND period.project_id = $1 AND step.status = 'running'
+                            AND period.project_id = $1
+                            AND ($2::bigint IS NULL OR period.activity_period_id = $2)
+                            AND step.status = 'running'
                     ) THEN 'running'
                     WHEN EXISTS (
                         SELECT 1 FROM workflow_step step
                         JOIN xingtu_activity_period period
                             ON period.activity_period_id = step.activity_period_id
                         WHERE step.workflow_run_id = run.workflow_run_id
-                            AND period.project_id = $1 AND step.status = 'failed'
+                            AND period.project_id = $1
+                            AND ($2::bigint IS NULL OR period.activity_period_id = $2)
+                            AND step.status = 'failed'
                     ) THEN 'failed'
                     WHEN EXISTS (
                         SELECT 1 FROM workflow_step step
                         JOIN xingtu_activity_period period
                             ON period.activity_period_id = step.activity_period_id
                         WHERE step.workflow_run_id = run.workflow_run_id
-                            AND period.project_id = $1 AND step.status = 'succeeded'
+                            AND period.project_id = $1
+                            AND ($2::bigint IS NULL OR period.activity_period_id = $2)
+                            AND step.status = 'succeeded'
                     ) THEN 'succeeded'
                     WHEN EXISTS (
                         SELECT 1 FROM workflow_step step
                         JOIN xingtu_activity_period period
                             ON period.activity_period_id = step.activity_period_id
                         WHERE step.workflow_run_id = run.workflow_run_id
-                            AND period.project_id = $1 AND step.status = 'skipped'
+                            AND period.project_id = $1
+                            AND ($2::bigint IS NULL OR period.activity_period_id = $2)
+                            AND step.status = 'skipped'
                     ) THEN 'skipped'
                     ELSE run.status
                 END AS status,
@@ -433,6 +445,7 @@ impl WorkflowRunRepository {
                     SELECT period.activity_period_id
                     FROM xingtu_activity_period period
                     WHERE period.project_id = $1
+                        AND ($2::bigint IS NULL OR period.activity_period_id = $2)
                         AND (
                             period.activity_period_id = run.scope_activity_period_id
                             OR EXISTS (
@@ -449,6 +462,7 @@ impl WorkflowRunRepository {
                         ON period.activity_period_id = step.activity_period_id
                     WHERE step.workflow_run_id = run.workflow_run_id
                         AND period.project_id = $1
+                        AND ($2::bigint IS NULL OR period.activity_period_id = $2)
                 ) AS step_count,
                 run.started_at,
                 run.heartbeat_at,
@@ -460,6 +474,7 @@ impl WorkflowRunRepository {
                         ON period.activity_period_id = step.activity_period_id
                     WHERE step.workflow_run_id = run.workflow_run_id
                         AND period.project_id = $1
+                        AND ($2::bigint IS NULL OR period.activity_period_id = $2)
                         AND step.error_message IS NOT NULL
                     ORDER BY step.error_message
                 ) AS error_messages,
@@ -468,6 +483,7 @@ impl WorkflowRunRepository {
             WHERE EXISTS (
                 SELECT 1 FROM xingtu_activity_period period
                 WHERE period.project_id = $1
+                    AND ($2::bigint IS NULL OR period.activity_period_id = $2)
                     AND (
                         period.activity_period_id = run.scope_activity_period_id
                         OR EXISTS (
@@ -478,17 +494,18 @@ impl WorkflowRunRepository {
                     )
             )
                 AND (
-                    NOT $2
+                    NOT $3
                     OR run.started_at >= (
                         (now() AT TIME ZONE 'Asia/Shanghai')::date::timestamp
                         AT TIME ZONE 'Asia/Shanghai'
                     )
                 )
             ORDER BY run.started_at DESC, run.workflow_run_id DESC
-            LIMIT $3
+            LIMIT $4
             "#,
         )
         .bind(project_id)
+        .bind(activity_period_id)
         .bind(today_only)
         .bind(limit.clamp(1, 1_000))
         .fetch_all(&self.pool)

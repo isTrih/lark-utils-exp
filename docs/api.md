@@ -640,6 +640,8 @@ curl -X POST "https://api.example.com/api/v1/workflows/pending/import" \
 ### `POST /api/v1/projects/{activity_period_id}/report/send`
 
 读取项目 CPM 配置和数据库当前累计数据，并向请求指定的飞书群聊发送模板卡片。
+发送应用取自项目绑定的审核配置；审核配置未指定独立 `feishu_app_id` 或项目尚未绑定审核配置时，
+回退到项目数据应用。消息历史会保存本次实际使用的应用 ID。
 
 请求体：
 
@@ -699,16 +701,17 @@ GET /api/v1/admin/feishu/chats/{chat_id}/members
 ```
 
 两个接口使用服务端配置的飞书应用身份和 tenant access token；调用方只提供本系统的登录 JWT
-或管理员 Bearer Token，不传飞书 Token。可传 `project_id` 使用项目数据应用，或传 `audit_config_id`
-使用任意审核配置的通知应用，两者不能同时传。按审核配置查询仅允许默认应用管理员；非默认应用必须传入
-拥有配置权限的 `project_id`。响应会保留飞书官方的 HTTP 状态码以及完整 `code/data/msg`
+或管理员 Bearer Token，不传飞书 Token。可传 `project_id` 使用项目应用，或传 `audit_config_id`
+使用任意审核配置的通知应用，两者不能同时传。`project_id` 配合 `app_usage=audit_notice` 时，使用
+该项目当前绑定审核配置的通知应用，配置未指定独立应用时回退项目数据应用。按审核配置查询仅允许默认应用管理员；
+非默认应用必须传入拥有配置权限的 `project_id`。响应会保留飞书官方的 HTTP 状态码以及完整 `code/data/msg`
 JSON 信封，不转换成项目自己的列表结构。每次请求只代理一页，下一页继续传入响应中的
 `page_token`，避免自动聚合改变官方分页语义。
 
 查询机器人所在群聊：
 
 ```bash
-curl "https://api.example.com/api/v1/admin/feishu/chats?project_id=1&user_id_type=union_id&sort_type=ByActiveTimeDesc&page_size=100" \
+curl "https://api.example.com/api/v1/admin/feishu/chats?project_id=1&app_usage=audit_notice&user_id_type=union_id&sort_type=ByActiveTimeDesc&page_size=100" \
   -H "Authorization: Bearer $MUTATION_API_TOKEN"
 ```
 
@@ -716,6 +719,7 @@ curl "https://api.example.com/api/v1/admin/feishu/chats?project_id=1&user_id_typ
 | --- | --- | --- |
 | `project_id` | 正整数 | 默认应用管理员可省略；非默认应用必填且须拥有配置权限 |
 | `audit_config_id` | 正整数 | 使用审核配置中的飞书应用；仅默认应用管理员可用，不能与 `project_id` 同传 |
+| `app_usage` | `project_data`、`audit_notice` | 默认 `project_data`；`audit_notice` 必须同时传 `project_id` |
 | `user_id_type` | `open_id`、`union_id`、`user_id` | 返回群主 ID 的类型；不传时使用飞书默认值 |
 | `sort_type` | `ByCreateTimeAsc`、`ByActiveTimeDesc` | 创建时间升序或活跃时间降序 |
 | `page_size` | 1..100 | 飞书默认 20 |
@@ -724,11 +728,11 @@ curl "https://api.example.com/api/v1/admin/feishu/chats?project_id=1&user_id_typ
 查询指定群聊成员：
 
 ```bash
-curl "https://api.example.com/api/v1/admin/feishu/chats/oc_xxxxxxxxxxxxxxxx/members?project_id=1&member_id_type=union_id&page_size=100" \
+curl "https://api.example.com/api/v1/admin/feishu/chats/oc_xxxxxxxxxxxxxxxx/members?project_id=1&app_usage=audit_notice&member_id_type=union_id&page_size=100" \
   -H "Authorization: Bearer $MUTATION_API_TOKEN"
 ```
 
-成员接口同样支持 `project_id` 或 `audit_config_id` 二选一；`member_id_type` 支持 `open_id`、`union_id`、`user_id`，还支持 `page_size` 和
+成员接口同样支持 `project_id`、`audit_config_id` 和 `app_usage`；`member_id_type` 支持 `open_id`、`union_id`、`user_id`，还支持 `page_size` 和
 `page_token`。机器人必须已在目标群内；飞书不会在该接口中返回机器人成员。使用 `user_id`
 时还需要为应用开通相应的用户 ID 字段权限。部署前请在飞书开放平台开启机器人能力以及群信息/
 群成员读取权限。官方参考：[获取用户或机器人所在的群列表](https://open.feishu.cn/document/server-docs/group/chat/list)、
@@ -823,6 +827,10 @@ GET /api/v1/queries/projects/{project_id}/workflows/latest
 `status`、`activity_period_ids` 和 `error_messages` 只根据指定项目的期次阶段计算，不会把同批次
 其他项目的失败误报到当前项目。
 
+两个接口都支持可选查询参数 `activity_period_id`。传入后，服务端先校验期次属于路径中的项目，
+再只根据该期次的 `workflow_step` 计算 `status`、`step_count`、`activity_period_ids` 和
+`error_messages`；省略时保持原有项目级查询行为。
+
 ### 项目级飞书开放平台应用
 
 一个飞书应用可以绑定多个主项目，一个主项目同时只绑定一个飞书应用。应用凭据只保存一份；
@@ -857,8 +865,9 @@ Content-Type: application/json
 
 解除绑定后，该项目恢复使用 `DEFAULT_FEISHU_APP_ID` 指定的数据库默认应用。旧部署未配置该变量时，
 才回退使用环境变量 `LARK_APP_ID`、`LARK_APP_SECRET`。
-工作流中的来源 Sheet 导入、主表与审核表同步、错误通知和日报卡片都会按项目选择数据处理应用。
-审核通知使用项目所绑定审核配置中的应用。项目绑定同时选择配置内的一项通知方案，因此切换绑定会一并切换应用、模板、群聊和审核员：
+工作流中的来源 Sheet 导入、主表与审核表同步和错误通知都会按项目选择数据处理应用。
+审核通知与日报卡片使用项目所绑定审核配置中的应用；配置未指定独立应用时回退到项目数据应用。
+项目绑定同时选择配置内的一项通知方案，因此切换绑定会一并切换应用、模板、群聊和审核员：
 
 ```http
 PUT /api/v1/admin/projects/1/audit-config-binding
@@ -872,7 +881,8 @@ Content-Type: application/json
 
 审核通知应用只负责发送卡片，待审核数据仍由项目数据处理应用读取，因此通知应用不需要访问项目多维表格。通知方案必须属于所选审核配置，数据库复合外键和绑定接口都会校验该约束。共享配置的修改会影响所有绑定项目，所以配置及绑定接口仅允许默认应用管理员调用。旧的 `audit-notice-feishu-app`、项目通知和项目审核员接口保留兼容，并同步修改当前绑定配置；新管理端应使用审核配置接口。
 
-群列表和群成员接口可增加 `project_id` 或 `audit_config_id` 查询参数指定应用身份；多维表数据表枚举继续使用 `project_id`。
+群列表和群成员接口可增加 `project_id` 或 `audit_config_id` 查询参数指定应用身份；带 `project_id` 时还可用
+`app_usage=audit_notice` 解析项目当前审核通知应用。多维表数据表枚举继续使用 `project_id`。
 电子表格格式化接口则在 JSON 请求体中增加可选 `project_id`。不传时均使用全局兜底应用。
 
 `GET /projects/{project_id}` 会同时返回 `feishu_app`、`audit_notice_feishu_app`、`audit_config_binding`、`notification`、

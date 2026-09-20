@@ -145,6 +145,13 @@ struct QueryProjectPath {
     project_id: i64,
 }
 
+#[derive(Debug, Default, Deserialize, ToParameters)]
+#[salvo(parameters(default_parameter_in = Query))]
+struct ProjectWorkflowQuery {
+    /// 可选活动期次；传入后只根据该期次的 workflow_step 计算状态。
+    activity_period_id: Option<i64>,
+}
+
 #[endpoint(
     tags("queries"),
     summary = "查询项目今日全部工作流",
@@ -152,6 +159,7 @@ struct QueryProjectPath {
 )]
 async fn list_project_workflows_today(
     path: QueryProjectPath,
+    query: ProjectWorkflowQuery,
     depot: &mut Depot,
 ) -> ApiResult<Vec<ProjectWorkflowRunRecord>> {
     if path.project_id <= 0 {
@@ -159,11 +167,13 @@ async fn list_project_workflows_today(
     }
     crate::server::auth::require_project_view(depot, path.project_id)?;
     let state = state_from_depot(depot)?;
+    validate_project_workflow_period(&state.pool, path.project_id, query.activity_period_id)
+        .await?;
     Ok(Json(
         state
             .workflow
             .workflow_run_repo
-            .list_project_runs_today(path.project_id)
+            .list_project_runs_today(path.project_id, query.activity_period_id)
             .await?,
     ))
 }
@@ -175,6 +185,7 @@ async fn list_project_workflows_today(
 )]
 async fn get_latest_project_workflow(
     path: QueryProjectPath,
+    query: ProjectWorkflowQuery,
     depot: &mut Depot,
 ) -> ApiResult<Option<ProjectWorkflowRunRecord>> {
     if path.project_id <= 0 {
@@ -182,13 +193,41 @@ async fn get_latest_project_workflow(
     }
     crate::server::auth::require_project_view(depot, path.project_id)?;
     let state = state_from_depot(depot)?;
+    validate_project_workflow_period(&state.pool, path.project_id, query.activity_period_id)
+        .await?;
     Ok(Json(
         state
             .workflow
             .workflow_run_repo
-            .latest_project_run(path.project_id)
+            .latest_project_run(path.project_id, query.activity_period_id)
             .await?,
     ))
+}
+
+async fn validate_project_workflow_period(
+    pool: &sqlx::PgPool,
+    project_id: i64,
+    activity_period_id: Option<i64>,
+) -> Result<(), ApiError> {
+    let Some(activity_period_id) = activity_period_id else {
+        return Ok(());
+    };
+    if activity_period_id <= 0 {
+        return Err(ApiError::bad_request("activity_period_id 必须大于 0"));
+    }
+    let belongs_to_project: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM xingtu_activity_period WHERE activity_period_id = $1 AND project_id = $2)",
+    )
+    .bind(activity_period_id)
+    .bind(project_id)
+    .fetch_one(pool)
+    .await?;
+    if !belongs_to_project {
+        return Err(ApiError::not_found(format!(
+            "活动期次 {activity_period_id} 不属于项目 {project_id}"
+        )));
+    }
+    Ok(())
 }
 
 #[endpoint(tags("queries"), summary = "查询全部当前项目")]
@@ -234,14 +273,14 @@ async fn send_project_report(
         .ok_or_else(|| {
             ApiError::not_found(format!("当前启用项目不存在：{}", path.activity_period_id))
         })?;
-    let project_lark = state
+    let report_lark = state
         .workflow
         .project_lark
-        .resolved_client_for_project(context.project_id)
+        .resolved_client_for_project_audit_config(context.project_id)
         .await?;
     let context_project_id = context.project_id;
     let result = project_report::send_project_report(
-        &project_lark.client,
+        &report_lark.client,
         context,
         mission,
         body.hot_videos.as_deref(),
@@ -266,7 +305,7 @@ async fn send_project_report(
             &receiver,
             Some(&result.project),
             Some(context_project_id),
-            project_lark.feishu_app_id,
+            report_lark.feishu_app_id,
             Some(result.activity_period_id),
         )
         .await;

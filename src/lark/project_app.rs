@@ -197,6 +197,29 @@ impl ProjectFeishuAppStore {
         })
     }
 
+    /// 使用项目当前绑定的审核配置应用；配置未指定应用时回退到项目数据应用。
+    pub async fn resolved_client_for_project_audit_config(
+        &self,
+        project_id: i64,
+    ) -> anyhow::Result<ResolvedFeishuAppClient> {
+        let feishu_app_id = sqlx::query_scalar::<_, Option<i64>>(
+            r#"
+            SELECT config.feishu_app_id
+            FROM xingtu_project_audit_config_binding binding
+            JOIN xingtu_audit_config config
+                ON config.audit_config_id = binding.audit_config_id
+            WHERE binding.project_id = $1
+            "#,
+        )
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("读取项目 {project_id} 的审核配置应用失败"))?
+        .flatten();
+        self.resolved_client_for_audit_config(project_id, feishu_app_id)
+            .await
+    }
+
     pub async fn client_for_audit_config(
         &self,
         audit_config_id: i64,

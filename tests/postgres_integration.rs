@@ -595,7 +595,7 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     repository
         .finish_run_success(project_run_id, json!({ "ok": true }))
         .await?;
-    let project_runs_today = repository.list_project_runs_today(project_id).await?;
+    let project_runs_today = repository.list_project_runs_today(project_id, None).await?;
     let project_run = project_runs_today
         .iter()
         .find(|run| run.workflow_run_id == project_run_id)
@@ -606,7 +606,7 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     assert_eq!(project_run.step_count, 1);
     assert_eq!(
         repository
-            .latest_project_run(project_id)
+            .latest_project_run(project_id, None)
             .await?
             .expect("项目最近工作流应存在")
             .workflow_run_id,
@@ -614,10 +614,84 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     );
     assert!(
         repository
-            .latest_project_run(other_project_id)
+            .latest_project_run(other_project_id, None)
             .await?
             .is_none()
     );
+
+    let other_activity_period_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO xingtu_activity_period (
+            project_id, xingtu_account_id, period, period_code, task_month, bitable_url
+        ) VALUES ($1, $2, $3, $4, DATE '2026-09-01', 'https://example.test/base')
+        RETURNING activity_period_id
+        "#,
+    )
+    .bind(project_id)
+    .bind(&project_account_id)
+    .bind(format!("{fixture}-other-period"))
+    .bind(format!("{fixture}-other-period"))
+    .fetch_one(&pool)
+    .await?;
+    let batch_run_id = repository
+        .start_run("period-query-integration", None, "test", None)
+        .await?;
+    let selected_period_step_id = repository
+        .start_step(
+            batch_run_id,
+            Some(activity_period_id),
+            "selected_period_success",
+            None,
+        )
+        .await?;
+    repository
+        .finish_step_success(selected_period_step_id, json!({ "rows": 1 }))
+        .await?;
+    let other_period_step_id = repository
+        .start_step(
+            batch_run_id,
+            Some(other_activity_period_id),
+            "other_period_failure",
+            None,
+        )
+        .await?;
+    repository
+        .finish_step_failure(other_period_step_id, "另一活动期次失败")
+        .await?;
+    repository
+        .finish_run_failure(
+            batch_run_id,
+            "partially_failed",
+            "partial_failure",
+            "批量运行部分失败",
+        )
+        .await?;
+
+    let selected_period_run = repository
+        .latest_project_run(project_id, Some(activity_period_id))
+        .await?
+        .expect("指定活动期次应查询到批量运行");
+    assert_eq!(selected_period_run.workflow_run_id, batch_run_id);
+    assert_eq!(selected_period_run.status, "succeeded");
+    assert_eq!(
+        selected_period_run.activity_period_ids,
+        vec![activity_period_id]
+    );
+    assert_eq!(selected_period_run.step_count, 1);
+    assert!(selected_period_run.error_messages.is_empty());
+
+    let other_period_run = repository
+        .latest_project_run(project_id, Some(other_activity_period_id))
+        .await?
+        .expect("另一活动期次应查询到批量运行");
+    assert_eq!(other_period_run.workflow_run_id, batch_run_id);
+    assert_eq!(other_period_run.status, "failed");
+    assert_eq!(
+        other_period_run.activity_period_ids,
+        vec![other_activity_period_id]
+    );
+    assert_eq!(other_period_run.step_count, 1);
+    assert_eq!(other_period_run.error_messages, vec!["另一活动期次失败"]);
 
     let active_run_id = repository
         .start_run("heartbeat-integration", None, "test", None)
