@@ -123,6 +123,8 @@ pub struct ActivityAuditNoticeConfig {
 #[derive(Debug, Clone)]
 pub struct AuditNoticeWorkflowConfig {
     pub project_id: i64,
+    /// 审核配置显式指定的发送应用；历史兼容配置为空时复用项目数据应用。
+    pub sender_feishu_app_id: Option<i64>,
     pub receiver: MessageReceiver,
     pub card_template_id: String,
     pub auditor_ids: String,
@@ -142,6 +144,7 @@ impl AuditNoticeWorkflowConfig {
     ) -> Self {
         Self {
             project_id: 0,
+            sender_feishu_app_id: None,
             receiver,
             card_template_id: card_template_id.into(),
             auditor_ids: auditor_ids.into(),

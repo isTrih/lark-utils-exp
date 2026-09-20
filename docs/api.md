@@ -752,8 +752,8 @@ curl --get "https://api.example.com/api/v1/admin/feishu/bitable/tables" \
 
 ### 主项目配置
 
-主项目把通知配置、星图账号、审核员和活动期次组织在同一个稳定的 `project_id` 下。
-这些配置各自只有一个数据库归属，不再复制到账号或期次表：
+主项目把运维通知、星图账号、审核配置绑定和活动期次组织在同一个稳定的 `project_id` 下。
+审核配置独立于项目，可供多个项目共享：
 
 ```text
 GET   /api/v1/admin/projects
@@ -771,6 +771,22 @@ DELETE /api/v1/admin/projects/{project_id}/feishu-app
 GET    /api/v1/admin/projects/{project_id}/audit-notice-feishu-app
 PUT    /api/v1/admin/projects/{project_id}/audit-notice-feishu-app
 DELETE /api/v1/admin/projects/{project_id}/audit-notice-feishu-app
+
+GET    /api/v1/admin/audit-configs
+POST   /api/v1/admin/audit-configs
+GET    /api/v1/admin/audit-configs/{audit_config_id}
+PUT    /api/v1/admin/audit-configs/{audit_config_id}
+DELETE /api/v1/admin/audit-configs/{audit_config_id}
+POST   /api/v1/admin/audit-configs/{audit_config_id}/targets
+PUT    /api/v1/admin/audit-configs/{audit_config_id}/targets/{audit_notification_target_id}
+DELETE /api/v1/admin/audit-configs/{audit_config_id}/targets/{audit_notification_target_id}
+POST   /api/v1/admin/audit-configs/{audit_config_id}/targets/{audit_notification_target_id}/auditors
+PUT    /api/v1/admin/audit-configs/{audit_config_id}/targets/{audit_notification_target_id}/auditors/{audit_notification_auditor_id}
+DELETE /api/v1/admin/audit-configs/{audit_config_id}/targets/{audit_notification_target_id}/auditors/{audit_notification_auditor_id}
+
+GET    /api/v1/admin/projects/{project_id}/audit-config-binding
+PUT    /api/v1/admin/projects/{project_id}/audit-config-binding
+DELETE /api/v1/admin/projects/{project_id}/audit-config-binding
 
 GET  /api/v1/admin/feishu/apps
 POST /api/v1/admin/feishu/apps
@@ -840,24 +856,24 @@ Content-Type: application/json
 解除绑定后，该项目恢复使用 `DEFAULT_FEISHU_APP_ID` 指定的数据库默认应用。旧部署未配置该变量时，
 才回退使用环境变量 `LARK_APP_ID`、`LARK_APP_SECRET`。
 工作流中的来源 Sheet 导入、主表与审核表同步、错误通知和日报卡片都会按项目选择数据处理应用。
-审核通知默认也复用该应用；少数需要分离机器人的项目可额外绑定审核通知应用：
+审核通知使用项目所绑定审核配置中的应用。项目绑定同时选择配置内的一项通知方案，因此切换绑定会一并切换应用、模板、群聊和审核员：
 
 ```http
-PUT /api/v1/admin/projects/1/audit-notice-feishu-app
+PUT /api/v1/admin/projects/1/audit-config-binding
 Content-Type: application/json
 
-{ "feishu_app_id": 3 }
+{
+  "audit_config_id": 3,
+  "audit_notification_target_id": 8
+}
 ```
 
-该覆盖只用于发送审核通知卡片，待审核数据仍由项目数据处理应用读取，因此通知应用不需要访问项目
-多维表格。`DELETE` 该绑定即可恢复复用项目应用。发送历史会记录实际发送应用，确保后续切换绑定后
-仍可用正确应用撤回旧卡片。同一飞书应用可作为多个项目的数据应用或审核通知应用，并共用 tenant
-access token 缓存。
+审核通知应用只负责发送卡片，待审核数据仍由项目数据处理应用读取，因此通知应用不需要访问项目多维表格。通知方案必须属于所选审核配置，数据库复合外键和绑定接口都会校验该约束。共享配置的修改会影响所有绑定项目，所以配置及绑定接口仅允许默认应用管理员调用。旧的 `audit-notice-feishu-app`、项目通知和项目审核员接口保留兼容，并同步修改当前绑定配置；新管理端应使用审核配置接口。
 
 管理类飞书接口可增加 `project_id` 查询参数，以指定应用身份：群列表、群成员、多维表数据表枚举。
 电子表格格式化接口则在 JSON 请求体中增加可选 `project_id`。不传时均使用全局兜底应用。
 
-`GET /projects/{project_id}` 会同时返回 `feishu_app`、`audit_notice_feishu_app`、`notification`、
+`GET /projects/{project_id}` 会同时返回 `feishu_app`、`audit_notice_feishu_app`、`audit_config_binding`、`notification`、
 `accounts`、`auditors` 和 `periods`；未绑定数据应用时 `feishu_app.uses_global_fallback=true`；
 未绑定独立审核通知应用时 `audit_notice_feishu_app.uses_project_feishu_app=true`。
 创建项目时通知配置必填：

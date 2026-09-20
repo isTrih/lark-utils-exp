@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod admin_sheet;
 pub mod api;
+pub mod audit_config;
 pub mod audit_extra_query;
 pub mod auth;
 pub mod cache;

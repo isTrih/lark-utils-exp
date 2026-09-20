@@ -54,6 +54,7 @@ async fn admin_js(res: &mut Response) {
 pub fn routes() -> Router {
     Router::with_path("admin")
         .hoop(require_management_access)
+        .push(crate::server::audit_config::routes())
         .push(
             Router::with_path("periods/statuses")
                 .hoop(require_default_actor)
@@ -89,7 +90,7 @@ pub fn routes() -> Router {
         )
         .push(
             Router::with_path("projects/{project_id}/notification")
-                .hoop(require_project_route_access)
+                .hoop(require_default_actor)
                 .get(get_project_notification)
                 .patch(update_project_notification),
         )
@@ -146,13 +147,13 @@ pub fn routes() -> Router {
         )
         .push(
             Router::with_path("projects/{project_id}/auditors")
-                .hoop(require_project_route_access)
+                .hoop(require_default_actor)
                 .get(list_project_auditors)
                 .post(create_project_auditor),
         )
         .push(
             Router::with_path("projects/{project_id}/auditors/{project_auditor_id}")
-                .hoop(require_project_route_access)
+                .hoop(require_default_actor)
                 .patch(update_project_auditor),
         )
         .push(
@@ -518,6 +519,7 @@ pub struct MasterProjectDetailDto {
     pub project: MasterProjectDto,
     pub feishu_app: ProjectFeishuAppBindingDto,
     pub audit_notice_feishu_app: ProjectAuditNoticeFeishuAppBindingDto,
+    pub audit_config_binding: Option<crate::server::audit_config::ProjectAuditConfigBindingDto>,
     pub notification: ProjectNotificationDto,
     pub accounts: Vec<MasterProjectAccountDto>,
     pub auditors: Vec<ProjectAuditorDto>,
@@ -847,6 +849,7 @@ async fn create_master_project(
     let display_name = required_text(&body.display_name, "display_name")?;
     validate_project_notification(&body.notification)?;
     let remark = trimmed_optional(body.remark.clone());
+    let mut tx = state.pool.begin().await?;
     let project_id: i64 = sqlx::query_scalar(
         r#"
         INSERT INTO xingtu_project (
@@ -867,8 +870,50 @@ async fn create_master_project(
     .bind(body.notification.login_notice_card_template_id.trim())
     .bind(body.is_active)
     .bind(remark)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await?;
+    let audit_config_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO xingtu_audit_config (
+            config_name, card_template_id, audit_result_field, is_active, remark
+        ) VALUES ($1, $2, $3, $4, $5)
+        RETURNING audit_config_id
+        "#,
+    )
+    .bind(format!("{project_key} 审核配置"))
+    .bind(body.notification.audit_notice_card_template_id.trim())
+    .bind(body.notification.audit_result_field.trim())
+    .bind(body.is_active)
+    .bind("创建项目时生成；未指定应用时复用项目数据处理应用")
+    .fetch_one(&mut *tx)
+    .await?;
+    let target_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO xingtu_audit_notification_target (
+            audit_config_id, target_name, receive_id_type, receive_id
+        ) VALUES ($1, $2, $3::xingtu_receive_id_type, $4)
+        RETURNING audit_notification_target_id
+        "#,
+    )
+    .bind(audit_config_id)
+    .bind("默认审核群")
+    .bind(body.notification.notification_receive_id_type.trim())
+    .bind(body.notification.notification_receive_id.trim())
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO xingtu_project_audit_config_binding (
+            project_id, audit_config_id, audit_notification_target_id
+        ) VALUES ($1, $2, $3)
+        "#,
+    )
+    .bind(project_id)
+    .bind(audit_config_id)
+    .bind(target_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     state.query_cache.invalidate_all_shared().await?;
     Ok(Json(
         fetch_master_project_detail(&state.pool, project_id).await?,
@@ -1324,6 +1369,20 @@ async fn update_project_notification(
     if let Some(value) = body.notification_receive_id_type.as_deref() {
         validate_receive_id_type(value)?;
     }
+    let receive_id_type = body
+        .notification_receive_id_type
+        .map(|value| value.trim().to_owned());
+    let receive_id =
+        required_optional_text(body.notification_receive_id, "notification_receive_id")?;
+    let card_template_id = required_optional_text(
+        body.audit_notice_card_template_id,
+        "audit_notice_card_template_id",
+    )?;
+    let audit_result_field = required_optional_text(body.audit_result_field, "audit_result_field")?;
+    let login_template_id = required_optional_text(
+        body.login_notice_card_template_id,
+        "login_notice_card_template_id",
+    )?;
     let mut tx = state.pool.begin().await?;
     lock_project(&mut tx, path.project_id, false).await?;
     sqlx::query(
@@ -1338,11 +1397,41 @@ async fn update_project_notification(
         "#,
     )
     .bind(path.project_id)
-    .bind(body.notification_receive_id_type.map(|v| v.trim().to_owned()))
-    .bind(required_optional_text(body.notification_receive_id, "notification_receive_id")?)
-    .bind(required_optional_text(body.audit_notice_card_template_id, "audit_notice_card_template_id")?)
-    .bind(required_optional_text(body.audit_result_field, "audit_result_field")?)
-    .bind(required_optional_text(body.login_notice_card_template_id, "login_notice_card_template_id")?)
+    .bind(receive_id_type.clone())
+    .bind(receive_id.clone())
+    .bind(card_template_id.clone())
+    .bind(audit_result_field.clone())
+    .bind(login_template_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE xingtu_audit_notification_target target SET
+            receive_id_type = COALESCE($2::xingtu_receive_id_type, target.receive_id_type),
+            receive_id = COALESCE($3, target.receive_id)
+        FROM xingtu_project_audit_config_binding binding
+        WHERE binding.project_id = $1
+          AND target.audit_notification_target_id = binding.audit_notification_target_id
+        "#,
+    )
+    .bind(path.project_id)
+    .bind(receive_id_type)
+    .bind(receive_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE xingtu_audit_config config SET
+            card_template_id = COALESCE($2, config.card_template_id),
+            audit_result_field = COALESCE($3, config.audit_result_field)
+        FROM xingtu_project_audit_config_binding binding
+        WHERE binding.project_id = $1
+          AND config.audit_config_id = binding.audit_config_id
+        "#,
+    )
+    .bind(path.project_id)
+    .bind(card_template_id)
+    .bind(audit_result_field)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1549,15 +1638,22 @@ async fn create_project_auditor(
     validate_auditor_id_type(&auditor_id, &body.auditor_id_type)?;
     let mut tx = state.pool.begin().await?;
     lock_project(&mut tx, path.project_id, true).await?;
-    let id: i64 = sqlx::query_scalar(
-        r#"
-        INSERT INTO xingtu_project_auditor (
-            project_id, auditor_name, auditor_id, auditor_id_type, sort_order, is_active
-        ) VALUES ($1, $2, $3, $4::xingtu_receive_id_type, $5, $6)
-        RETURNING project_auditor_id
-        "#,
+    let target_id: i64 = sqlx::query_scalar(
+        "SELECT audit_notification_target_id FROM xingtu_project_audit_config_binding WHERE project_id = $1",
     )
     .bind(path.project_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::conflict("项目尚未绑定审核配置及通知方案"))?;
+    let id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO xingtu_audit_notification_auditor (
+            audit_notification_target_id, auditor_name, auditor_id, auditor_id_type, sort_order, is_active
+        ) VALUES ($1, $2, $3, $4::xingtu_receive_id_type, $5, $6)
+        RETURNING audit_notification_auditor_id
+        "#,
+    )
+    .bind(target_id)
     .bind(name)
     .bind(auditor_id)
     .bind(body.auditor_id_type.trim())
@@ -1589,7 +1685,14 @@ async fn update_project_auditor(
         .transpose()?;
     if let Some(value) = body.auditor_id_type.as_deref() {
         let auditor_id: String = sqlx::query_scalar(
-            "SELECT auditor_id FROM xingtu_project_auditor WHERE project_id = $1 AND project_auditor_id = $2",
+            r#"
+            SELECT auditor.auditor_id
+            FROM xingtu_project_audit_config_binding binding
+            JOIN xingtu_audit_notification_auditor auditor
+              ON auditor.audit_notification_target_id = binding.audit_notification_target_id
+            WHERE binding.project_id = $1
+              AND auditor.audit_notification_auditor_id = $2
+            "#,
         )
         .bind(path.project_id)
         .bind(path.project_auditor_id)
@@ -1600,10 +1703,15 @@ async fn update_project_auditor(
     }
     let row = sqlx::query(
         r#"
-        UPDATE xingtu_project_auditor SET auditor_name = COALESCE($3, auditor_name),
+        UPDATE xingtu_audit_notification_auditor auditor
+        SET auditor_name = COALESCE($3, auditor_name),
             auditor_id_type = COALESCE($4::xingtu_receive_id_type, auditor_id_type),
             sort_order = COALESCE($5, sort_order), is_active = COALESCE($6, is_active)
-        WHERE project_id = $1 AND project_auditor_id = $2 RETURNING project_auditor_id
+        FROM xingtu_project_audit_config_binding binding
+        WHERE binding.project_id = $1
+          AND auditor.audit_notification_target_id = binding.audit_notification_target_id
+          AND auditor.audit_notification_auditor_id = $2
+        RETURNING auditor.audit_notification_auditor_id AS project_auditor_id
         "#,
     )
     .bind(path.project_id)
@@ -2455,7 +2563,11 @@ fn master_project_select_sql() -> &'static str {
         project.is_active,
         project.remark,
         (SELECT COUNT(*) FROM xingtu_project_account account WHERE account.project_id = project.project_id) AS account_count,
-        (SELECT COUNT(*) FROM xingtu_project_auditor auditor WHERE auditor.project_id = project.project_id) AS auditor_count,
+        (SELECT COUNT(*)
+         FROM xingtu_project_audit_config_binding binding
+         JOIN xingtu_audit_notification_auditor auditor
+           ON auditor.audit_notification_target_id = binding.audit_notification_target_id
+         WHERE binding.project_id = project.project_id) AS auditor_count,
         (SELECT COUNT(*) FROM xingtu_activity_period period WHERE period.project_id = project.project_id) AS period_count,
         project.created_at,
         project.updated_at
@@ -2489,11 +2601,15 @@ async fn fetch_master_project_detail(
     .await?;
     let auditor_rows = sqlx::query(
         r#"
-        SELECT project_auditor_id, project_id, auditor_name, auditor_id,
-            auditor_id_type::text AS auditor_id_type, sort_order, is_active, created_at, updated_at
-        FROM xingtu_project_auditor
-        WHERE project_id = $1
-        ORDER BY sort_order, project_auditor_id
+        SELECT auditor.audit_notification_auditor_id AS project_auditor_id,
+            binding.project_id, auditor.auditor_name, auditor.auditor_id,
+            auditor.auditor_id_type::text AS auditor_id_type, auditor.sort_order,
+            auditor.is_active, auditor.created_at, auditor.updated_at
+        FROM xingtu_project_audit_config_binding binding
+        JOIN xingtu_audit_notification_auditor auditor
+          ON auditor.audit_notification_target_id = binding.audit_notification_target_id
+        WHERE binding.project_id = $1
+        ORDER BY auditor.sort_order, auditor.audit_notification_auditor_id
         "#,
     )
     .bind(project_id)
@@ -2522,6 +2638,8 @@ async fn fetch_master_project_detail(
             project_id,
             audit_notice_app_binding,
         ),
+        audit_config_binding: crate::server::audit_config::fetch_project_binding(pool, project_id)
+            .await?,
         notification: fetch_project_notification(pool, project_id).await?,
         accounts: account_rows
             .into_iter()
@@ -2555,6 +2673,12 @@ async fn fetch_project_app_binding(
                 UNION
                 SELECT project_id FROM xingtu_project_audit_notice_feishu_app_binding
                 WHERE feishu_app_id = app.feishu_app_id
+                UNION
+                SELECT binding.project_id
+                FROM xingtu_project_audit_config_binding binding
+                JOIN xingtu_audit_config config
+                  ON config.audit_config_id = binding.audit_config_id
+                WHERE config.feishu_app_id = app.feishu_app_id
             ) projects) AS project_count
         FROM {table} binding
         JOIN xingtu_feishu_app app ON app.feishu_app_id = binding.feishu_app_id
@@ -2796,11 +2920,15 @@ fn project_account_select_sql() -> &'static str {
 
 fn project_auditor_select_sql() -> &'static str {
     r#"
-    SELECT project_auditor_id, project_id, auditor_name, auditor_id,
-        auditor_id_type::text AS auditor_id_type, sort_order, is_active, created_at, updated_at
-    FROM xingtu_project_auditor
-    WHERE project_id = $1 AND ($2::boolean OR is_active = true)
-    ORDER BY sort_order, project_auditor_id
+    SELECT auditor.audit_notification_auditor_id AS project_auditor_id,
+        binding.project_id, auditor.auditor_name, auditor.auditor_id,
+        auditor.auditor_id_type::text AS auditor_id_type, auditor.sort_order,
+        auditor.is_active, auditor.created_at, auditor.updated_at
+    FROM xingtu_project_audit_config_binding binding
+    JOIN xingtu_audit_notification_auditor auditor
+      ON auditor.audit_notification_target_id = binding.audit_notification_target_id
+    WHERE binding.project_id = $1 AND ($2::boolean OR auditor.is_active = true)
+    ORDER BY auditor.sort_order, auditor.audit_notification_auditor_id
     "#
 }
 
@@ -2810,10 +2938,22 @@ async fn fetch_project_notification(
 ) -> Result<ProjectNotificationDto, ApiError> {
     let row = sqlx::query(
         r#"
-        SELECT project_id, notification_receive_id_type::text AS notification_receive_id_type,
-            notification_receive_id, audit_notice_card_template_id,
-            audit_result_field, login_notice_card_template_id
-        FROM xingtu_project WHERE project_id = $1
+        SELECT project.project_id,
+            COALESCE(target.receive_id_type, project.notification_receive_id_type)::text
+                AS notification_receive_id_type,
+            COALESCE(target.receive_id, project.notification_receive_id) AS notification_receive_id,
+            COALESCE(config.card_template_id, project.audit_notice_card_template_id)
+                AS audit_notice_card_template_id,
+            COALESCE(config.audit_result_field, project.audit_result_field) AS audit_result_field,
+            project.login_notice_card_template_id
+        FROM xingtu_project project
+        LEFT JOIN xingtu_project_audit_config_binding binding
+          ON binding.project_id = project.project_id
+        LEFT JOIN xingtu_audit_config config
+          ON config.audit_config_id = binding.audit_config_id
+        LEFT JOIN xingtu_audit_notification_target target
+          ON target.audit_notification_target_id = binding.audit_notification_target_id
+        WHERE project.project_id = $1
         "#,
     )
     .bind(project_id)
@@ -2859,10 +2999,15 @@ async fn fetch_project_auditor(
 ) -> Result<ProjectAuditorDto, ApiError> {
     let row = sqlx::query(
         r#"
-        SELECT project_auditor_id, project_id, auditor_name, auditor_id,
-            auditor_id_type::text AS auditor_id_type, sort_order, is_active, created_at, updated_at
-        FROM xingtu_project_auditor
-        WHERE project_id = $1 AND project_auditor_id = $2
+        SELECT auditor.audit_notification_auditor_id AS project_auditor_id,
+            binding.project_id, auditor.auditor_name, auditor.auditor_id,
+            auditor.auditor_id_type::text AS auditor_id_type, auditor.sort_order,
+            auditor.is_active, auditor.created_at, auditor.updated_at
+        FROM xingtu_project_audit_config_binding binding
+        JOIN xingtu_audit_notification_auditor auditor
+          ON auditor.audit_notification_target_id = binding.audit_notification_target_id
+        WHERE binding.project_id = $1
+          AND auditor.audit_notification_auditor_id = $2
         "#,
     )
     .bind(project_id)
@@ -3008,7 +3153,8 @@ fn map_project_auditor_insert_error(error: sqlx::Error) -> ApiError {
         .and_then(|database_error| database_error.constraint());
     match constraint {
         Some("uq_xingtu_project_auditor_project_auditor")
-        | Some("xingtu_project_auditor_project_auditor_id_key") => {
+        | Some("xingtu_project_auditor_project_auditor_id_key")
+        | Some("uq_xingtu_audit_target_auditor") => {
             ApiError::conflict("该项目已存在相同 auditor_id 的审核员")
         }
         Some("xingtu_project_auditor_pkey") => ApiError::internal_with_message(

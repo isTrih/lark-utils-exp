@@ -182,6 +182,21 @@ impl ProjectFeishuAppStore {
         })
     }
 
+    /// 新审核配置显式指定发送应用；历史迁移出的空值兼容复用项目数据应用。
+    pub async fn resolved_client_for_audit_config(
+        &self,
+        project_id: i64,
+        feishu_app_id: Option<i64>,
+    ) -> anyhow::Result<ResolvedFeishuAppClient> {
+        let Some(feishu_app_id) = feishu_app_id else {
+            return self.resolved_client_for_project(project_id).await;
+        };
+        Ok(ResolvedFeishuAppClient {
+            client: self.client_for_feishu_app(feishu_app_id).await?,
+            feishu_app_id: Some(feishu_app_id),
+        })
+    }
+
     pub async fn client_for_feishu_app(&self, feishu_app_id: i64) -> anyhow::Result<LarkClient> {
         if self.default_database_app_id == Some(feishu_app_id) {
             return Ok(self.default_client.clone());
@@ -394,6 +409,18 @@ impl ProjectFeishuAppStore {
         .bind(feishu_app_id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            r#"
+            UPDATE xingtu_audit_config config SET feishu_app_id = $2
+            FROM xingtu_project_audit_config_binding binding
+            WHERE binding.project_id = $1
+              AND config.audit_config_id = binding.audit_config_id
+            "#,
+        )
+        .bind(project_id)
+        .bind(feishu_app_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         self.get_audit_notice_project_binding(project_id)
             .await?
@@ -413,12 +440,25 @@ impl ProjectFeishuAppStore {
     }
 
     pub async fn unbind_audit_notice_project(&self, project_id: i64) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "DELETE FROM xingtu_project_audit_notice_feishu_app_binding WHERE project_id = $1",
         )
         .bind(project_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            r#"
+            UPDATE xingtu_audit_config config SET feishu_app_id = NULL
+            FROM xingtu_project_audit_config_binding binding
+            WHERE binding.project_id = $1
+              AND config.audit_config_id = binding.audit_config_id
+            "#,
+        )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -440,6 +480,12 @@ async fn get_project_binding_from_table(
                 UNION
                 SELECT project_id FROM xingtu_project_audit_notice_feishu_app_binding
                 WHERE feishu_app_id = app.feishu_app_id
+                UNION
+                SELECT binding.project_id
+                FROM xingtu_project_audit_config_binding binding
+                JOIN xingtu_audit_config config
+                  ON config.audit_config_id = binding.audit_config_id
+                WHERE config.feishu_app_id = app.feishu_app_id
             ) projects) AS project_count
         FROM {table} binding
         JOIN xingtu_feishu_app app ON app.feishu_app_id = binding.feishu_app_id
@@ -568,6 +614,12 @@ fn feishu_app_select_sql() -> &'static str {
             UNION
             SELECT project_id FROM xingtu_project_audit_notice_feishu_app_binding
             WHERE feishu_app_id = app.feishu_app_id
+            UNION
+            SELECT binding.project_id
+            FROM xingtu_project_audit_config_binding binding
+            JOIN xingtu_audit_config config
+              ON config.audit_config_id = binding.audit_config_id
+            WHERE config.feishu_app_id = app.feishu_app_id
         ) projects) AS project_count
     FROM xingtu_feishu_app app
     WHERE ($1::boolean OR app.is_active = true)

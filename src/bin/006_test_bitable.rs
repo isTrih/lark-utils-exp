@@ -63,6 +63,7 @@ fn build_current_workflow_config() -> anyhow::Result<DailyMorningReviewWorkflowC
         ],
         audit_notice: Some(AuditNoticeWorkflowConfig {
             project_id: 0,
+            sender_feishu_app_id: None,
             receiver: MessageReceiver {
                 receive_id_type: ReceiveIdType::ChatId,
                 receive_id: "oc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),

@@ -482,7 +482,7 @@ impl XingtuActivityConfigRepository {
                 p.project_id,
                 p.period,
                 p.bitable_url,
-                project.audit_result_field,
+                COALESCE(audit_config.audit_result_field, project.audit_result_field) AS audit_result_field,
                 c.content_config_id,
                 c.content_type::text AS content_type,
                 c.audit_table_id
@@ -490,6 +490,10 @@ impl XingtuActivityConfigRepository {
             JOIN xingtu_activity_period p
                 ON p.activity_period_id = c.activity_period_id
             JOIN xingtu_project project ON project.project_id = p.project_id
+            LEFT JOIN xingtu_project_audit_config_binding audit_binding
+                ON audit_binding.project_id = p.project_id
+            LEFT JOIN xingtu_audit_config audit_config
+                ON audit_config.audit_config_id = audit_binding.audit_config_id
             WHERE
                 p.is_active = true
                 AND c.sync_enabled = true
@@ -524,7 +528,7 @@ impl XingtuActivityConfigRepository {
     ///
     /// 每期活动的卡片跳转链接直接使用 `bitable_url`，待审核数量由通知流程读取
     /// 直播/视频 audit 表后统计 `audit_result_field` 为空的记录。每个活动期次独立
-    /// 使用自己的接收群和模板，并读取所属项目当前启用的审核人。
+    /// 使用项目所绑定审核配置中的发送应用、模板和通知方案。
     pub async fn build_audit_notice_configs_from_db(
         &self,
         tracking_run_at: Option<DateTime<Utc>>,
@@ -538,10 +542,12 @@ impl XingtuActivityConfigRepository {
                 project.display_name AS project,
                 p.period,
                 p.bitable_url,
-                project.notification_receive_id AS project_group_id,
-                project.notification_receive_id_type::text AS receive_id_type,
-                project.audit_notice_card_template_id AS notice_card_template_id,
-                project.audit_result_field,
+                audit_config.feishu_app_id AS sender_feishu_app_id,
+                target.audit_notification_target_id,
+                target.receive_id AS project_group_id,
+                target.receive_id_type::text AS receive_id_type,
+                audit_config.card_template_id AS notice_card_template_id,
+                audit_config.audit_result_field,
                 p.tracking_start_date,
                 p.tracking_end_date,
                 c.content_type::text AS content_type,
@@ -550,11 +556,19 @@ impl XingtuActivityConfigRepository {
             JOIN xingtu_activity_content_config c
                 ON c.activity_period_id = p.activity_period_id
             JOIN xingtu_project project ON project.project_id = p.project_id
+            JOIN xingtu_project_audit_config_binding audit_binding
+                ON audit_binding.project_id = p.project_id
+            JOIN xingtu_audit_config audit_config
+                ON audit_config.audit_config_id = audit_binding.audit_config_id
+                AND audit_config.is_active = true
+            JOIN xingtu_audit_notification_target target
+                ON target.audit_config_id = audit_binding.audit_config_id
+                AND target.audit_notification_target_id = audit_binding.audit_notification_target_id
+                AND target.is_active = true
             WHERE
                 p.is_active = true
                 AND p.morning_review_enabled = true
                 AND project.is_active = true
-                AND project.notification_receive_id IS NOT NULL
                 AND c.sync_enabled = true
                 AND c.audit_table_id IS NOT NULL
                 AND btrim(c.audit_table_id) <> ''
@@ -581,6 +595,7 @@ impl XingtuActivityConfigRepository {
 
             let activity_period_id: i64 = row.try_get("activity_period_id")?;
             let project_id: i64 = row.try_get("project_id")?;
+            let sender_feishu_app_id: Option<i64> = row.try_get("sender_feishu_app_id")?;
             let project: String = row.try_get("project")?;
             let period: String = row.try_get("period")?;
             let bitable_url: String = row.try_get("bitable_url")?;
@@ -596,11 +611,12 @@ impl XingtuActivityConfigRepository {
             } else {
                 let index = configs.len();
                 let auditor_ids = self
-                    .active_auditor_ids_for_project(project_id)
+                    .active_auditor_ids_for_target(row.try_get("audit_notification_target_id")?)
                     .await
-                    .with_context(|| format!("查询项目审核人失败：{project}"))?;
+                    .with_context(|| format!("查询审核通知方案审核人失败：{project}"))?;
                 configs.push(AuditNoticeWorkflowConfig {
                     project_id,
+                    sender_feishu_app_id,
                     receiver: crate::lark::im::MessageReceiver {
                         receive_id_type: crate::lark::im::parse_receive_id_type(&receive_id_type)?,
                         receive_id: project_group_id,
@@ -639,25 +655,22 @@ impl XingtuActivityConfigRepository {
         Ok(configs)
     }
 
-    /// 读取项目级当前启用的审核人。
-    ///
-    /// 审核通知只认 `xingtu_project_auditor`；账号表中的 `ops_ids`
-    /// 仅用于星图登录态和工作流错误通知。
-    async fn active_auditor_ids_for_project(&self, project_id: i64) -> anyhow::Result<String> {
+    /// 读取当前通知方案启用的审核人；账号表中的 `ops_ids` 只用于运维通知。
+    async fn active_auditor_ids_for_target(&self, target_id: i64) -> anyhow::Result<String> {
         let rows = sqlx::query(
             r#"
             SELECT auditor_id
-            FROM xingtu_project_auditor
+            FROM xingtu_audit_notification_auditor
             WHERE
-                project_id = $1
+                audit_notification_target_id = $1
                 AND is_active = true
-            ORDER BY sort_order, project_auditor_id
+            ORDER BY sort_order, audit_notification_auditor_id
             "#,
         )
-        .bind(project_id)
+        .bind(target_id)
         .fetch_all(&self.pool)
         .await
-        .context("查询生效的项目审核人失败")?;
+        .context("查询生效的通知方案审核人失败")?;
         let auditor_ids = rows
             .into_iter()
             .map(|row| row.try_get::<String, _>("auditor_id"))
@@ -666,9 +679,9 @@ impl XingtuActivityConfigRepository {
             .join(",");
 
         tracing::info!(
-            project_id,
+            audit_notification_target_id = target_id,
             auditor_ids = %auditor_ids,
-            "审核通知已读取生效的项目审核人"
+            "审核通知已读取生效的通知方案审核人"
         );
         Ok(auditor_ids)
     }

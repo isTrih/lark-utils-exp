@@ -151,6 +151,12 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     .bind(format!("{fixture}-other"))
     .fetch_one(&pool)
     .await?;
+    let duplicate_audit_project_id: i64 = sqlx::query_scalar(
+        "INSERT INTO xingtu_project (project_key, display_name, notification_receive_id) VALUES ($1, $1, 'integration-chat') RETURNING project_id",
+    )
+    .bind(format!("{fixture}-same-audit"))
+    .fetch_one(&pool)
+    .await?;
     let project_account_id = format!("project-account-{run_id}");
     sqlx::query(
         r#"
@@ -171,6 +177,17 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
         "#,
     )
     .bind(project_id)
+    .bind(format!("auditor-{run_id}"))
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO xingtu_project_auditor (
+            project_id, auditor_name, auditor_id
+        ) VALUES ($1, 'Integration Auditor', $2)
+        "#,
+    )
+    .bind(duplicate_audit_project_id)
     .bind(format!("auditor-{run_id}"))
     .execute(&pool)
     .await?;
@@ -487,6 +504,65 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
     assert!(legacy_video_extra.0["key"].is_object());
 
     migrations.run(&pool).await?;
+
+    let (audit_config_id, audit_target_id): (i64, i64) = sqlx::query_as(
+        r#"
+        SELECT audit_config_id, audit_notification_target_id
+        FROM xingtu_project_audit_config_binding
+        WHERE project_id = $1
+        "#,
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await?;
+    let migrated_auditors: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM xingtu_audit_notification_auditor WHERE audit_notification_target_id = $1",
+    )
+    .bind(audit_target_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(migrated_auditors, 1);
+    let duplicate_audit_binding: (i64, i64) = sqlx::query_as(
+        "SELECT audit_config_id, audit_notification_target_id FROM xingtu_project_audit_config_binding WHERE project_id = $1",
+    )
+    .bind(duplicate_audit_project_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(duplicate_audit_binding, (audit_config_id, audit_target_id));
+
+    let other_target_id: i64 = sqlx::query_scalar(
+        "SELECT audit_notification_target_id FROM xingtu_project_audit_config_binding WHERE project_id = $1",
+    )
+    .bind(other_project_id)
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        sqlx::query(
+            "UPDATE xingtu_project_audit_config_binding SET audit_config_id = $2, audit_notification_target_id = $3 WHERE project_id = $1",
+        )
+        .bind(other_project_id)
+        .bind(audit_config_id)
+        .bind(other_target_id)
+        .execute(&pool)
+        .await
+        .is_err(),
+        "项目不能选择另一审核配置下的通知方案"
+    );
+    sqlx::query(
+        "UPDATE xingtu_project_audit_config_binding SET audit_config_id = $2, audit_notification_target_id = $3 WHERE project_id = $1",
+    )
+    .bind(other_project_id)
+    .bind(audit_config_id)
+    .bind(audit_target_id)
+    .execute(&pool)
+    .await?;
+    let shared_project_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM xingtu_project_audit_config_binding WHERE audit_config_id = $1",
+    )
+    .bind(audit_config_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(shared_project_count, 3);
 
     let run = repository
         .list_runs(100, 0)
@@ -1080,6 +1156,14 @@ async fn operational_reliability_database_contracts() -> anyhow::Result<()> {
         .await?;
     sqlx::query("DELETE FROM xingtu_project WHERE project_id = $1")
         .bind(other_project_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM xingtu_project_auditor WHERE project_id = $1")
+        .bind(duplicate_audit_project_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM xingtu_project WHERE project_id = $1")
+        .bind(duplicate_audit_project_id)
         .execute(&pool)
         .await?;
 

@@ -1361,7 +1361,10 @@ impl XingtuWorkflowService {
             );
             let notice_lark = self
                 .project_lark
-                .resolved_client_for_audit_notice(notice_config.project_id)
+                .resolved_client_for_audit_config(
+                    notice_config.project_id,
+                    notice_config.sender_feishu_app_id,
+                )
                 .await
                 .with_context(|| format!("初始化项目 `{project_name}` 的审核通知飞书应用失败"))?;
             let result = FeishuImClient::new(&notice_lark.client)
