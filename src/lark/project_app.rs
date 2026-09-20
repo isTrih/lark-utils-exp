@@ -197,6 +197,21 @@ impl ProjectFeishuAppStore {
         })
     }
 
+    pub async fn client_for_audit_config(
+        &self,
+        audit_config_id: i64,
+    ) -> anyhow::Result<LarkClient> {
+        let feishu_app_id = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT feishu_app_id FROM xingtu_audit_config WHERE audit_config_id = $1",
+        )
+        .bind(audit_config_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow!("审核配置不存在：{audit_config_id}"))?
+        .ok_or_else(|| anyhow!("审核配置尚未指定飞书应用：{audit_config_id}"))?;
+        self.client_for_feishu_app(feishu_app_id).await
+    }
+
     pub async fn client_for_feishu_app(&self, feishu_app_id: i64) -> anyhow::Result<LarkClient> {
         if self.default_database_app_id == Some(feishu_app_id) {
             return Ok(self.default_client.clone());

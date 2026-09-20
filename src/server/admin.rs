@@ -310,6 +310,8 @@ struct OperationalListQuery {
 struct FeishuChatListQuery {
     /// 使用指定项目绑定的飞书应用；不传时使用全局应用。
     project_id: Option<i64>,
+    /// 使用指定审核配置绑定的飞书应用；不能与 project_id 同时传入。
+    audit_config_id: Option<i64>,
     /// 群主用户 ID 类型：open_id、union_id 或 user_id。缺省时使用飞书默认值。
     user_id_type: Option<String>,
     /// 排序方式：ByCreateTimeAsc 或 ByActiveTimeDesc。
@@ -325,6 +327,8 @@ struct FeishuChatListQuery {
 struct FeishuChatMembersQuery {
     /// 使用指定项目绑定的飞书应用；不传时使用全局应用。
     project_id: Option<i64>,
+    /// 使用指定审核配置绑定的飞书应用；不能与 project_id 同时传入。
+    audit_config_id: Option<i64>,
     /// 成员 ID 类型：open_id、union_id 或 user_id。缺省时使用飞书默认值。
     member_id_type: Option<String>,
     /// 单页数量，范围 1..=100，飞书默认 20。
@@ -2186,7 +2190,7 @@ async fn normalize_live_sessions(
 #[endpoint(
     tags("admin"),
     summary = "查询机器人所在的群聊",
-    description = "以应用身份调用飞书群列表接口，并透传飞书官方 code/data/msg 响应和 HTTP 状态码。默认应用管理员可省略 project_id；非默认应用必须指定拥有配置权限的 project_id，并使用该项目绑定的飞书应用。"
+    description = "以应用身份调用飞书群列表接口，并透传飞书官方 code/data/msg 响应和 HTTP 状态码。project_id 与 audit_config_id 二选一；按审核配置查询仅允许默认应用管理员。"
 )]
 async fn list_bot_chats(
     query: FeishuChatListQuery,
@@ -2194,10 +2198,11 @@ async fn list_bot_chats(
     res: &mut Response,
 ) -> ApiResult<serde_json::Value> {
     let project_id = query.project_id;
-    crate::server::auth::require_optional_project_manage(depot, project_id)?;
+    let audit_config_id = query.audit_config_id;
+    require_admin_lark_scope(depot, project_id, audit_config_id)?;
     let query = build_chat_list_query(query)?;
     let state = state_from_depot(depot)?;
-    let lark = admin_lark_client(&state.workflow, project_id).await?;
+    let lark = admin_lark_client(&state.workflow, project_id, audit_config_id).await?;
     let upstream = lark
         .get_openapi_json(&["im", "v1", "chats"], &query)
         .await
@@ -2220,7 +2225,7 @@ async fn list_bitable_tables(
     let mut params = vec![("page_size", "99".to_owned())];
     append_feishu_page_token(&mut params, query.page_token)?;
     let state = state_from_depot(depot)?;
-    let lark = admin_lark_client(&state.workflow, query.project_id).await?;
+    let lark = admin_lark_client(&state.workflow, query.project_id, None).await?;
     let upstream = lark
         .get_openapi_json(&["bitable", "v1", "apps", &app_token, "tables"], &params)
         .await
@@ -2232,7 +2237,7 @@ async fn list_bitable_tables(
 #[endpoint(
     tags("admin"),
     summary = "查询指定群聊的成员",
-    description = "以应用身份调用飞书群成员接口；member_id_type 支持 open_id、union_id、user_id，并透传飞书官方响应。默认应用管理员可省略 project_id；非默认应用必须指定拥有配置权限的 project_id，并使用该项目绑定的飞书应用。"
+    description = "以应用身份调用飞书群成员接口；member_id_type 支持 open_id、union_id、user_id，并透传飞书官方响应。project_id 与 audit_config_id 二选一；按审核配置查询仅允许默认应用管理员。"
 )]
 async fn list_chat_members(
     path: FeishuChatPath,
@@ -2242,10 +2247,11 @@ async fn list_chat_members(
 ) -> ApiResult<serde_json::Value> {
     let chat_id = validate_feishu_chat_id(&path.chat_id)?;
     let project_id = query.project_id;
-    crate::server::auth::require_optional_project_manage(depot, project_id)?;
+    let audit_config_id = query.audit_config_id;
+    require_admin_lark_scope(depot, project_id, audit_config_id)?;
     let query = build_chat_members_query(query)?;
     let state = state_from_depot(depot)?;
-    let lark = admin_lark_client(&state.workflow, project_id).await?;
+    let lark = admin_lark_client(&state.workflow, project_id, audit_config_id).await?;
     let upstream = lark
         .get_openapi_json(&["im", "v1", "chats", &chat_id, "members"], &query)
         .await
@@ -2803,7 +2809,15 @@ fn validate_feishu_app_input(
 async fn admin_lark_client(
     workflow: &XingtuWorkflowService,
     project_id: Option<i64>,
+    audit_config_id: Option<i64>,
 ) -> Result<LarkClient, ApiError> {
+    if let Some(audit_config_id) = audit_config_id {
+        return workflow
+            .project_lark
+            .client_for_audit_config(audit_config_id)
+            .await
+            .map_err(map_feishu_app_error);
+    }
     match project_id {
         Some(project_id) if project_id <= 0 => Err(ApiError::bad_request("project_id 必须大于 0")),
         Some(project_id) => workflow
@@ -2815,6 +2829,41 @@ async fn admin_lark_client(
     }
 }
 
+fn require_admin_lark_scope(
+    depot: &Depot,
+    project_id: Option<i64>,
+    audit_config_id: Option<i64>,
+) -> Result<(), ApiError> {
+    validate_admin_lark_scope_ids(project_id, audit_config_id)?;
+    if audit_config_id.is_some() {
+        if !crate::server::auth::actor_from_depot(depot)?.is_default_admin() {
+            return Err(ApiError::forbidden(
+                "只有默认飞书应用管理员可以按审核配置选择应用",
+            ));
+        }
+        return Ok(());
+    }
+    crate::server::auth::require_optional_project_manage(depot, project_id)
+}
+
+fn validate_admin_lark_scope_ids(
+    project_id: Option<i64>,
+    audit_config_id: Option<i64>,
+) -> Result<(), ApiError> {
+    if project_id.is_some() && audit_config_id.is_some() {
+        return Err(ApiError::bad_request(
+            "project_id 与 audit_config_id 不能同时传入",
+        ));
+    }
+    if project_id.is_some_and(|value| value <= 0) {
+        return Err(ApiError::bad_request("project_id 必须大于 0"));
+    }
+    if audit_config_id.is_some_and(|value| value <= 0) {
+        return Err(ApiError::bad_request("audit_config_id 必须大于 0"));
+    }
+    Ok(())
+}
+
 fn map_feishu_app_error(error: anyhow::Error) -> ApiError {
     if let Some(sqlx_error) = error.downcast_ref::<sqlx::Error>()
         && sqlx_error
@@ -2824,9 +2873,10 @@ fn map_feishu_app_error(error: anyhow::Error) -> ApiError {
         return ApiError::conflict("该飞书 APP_ID 已存在");
     }
     let message = error.to_string();
-    if message.contains("飞书应用不存在") {
+    if message.contains("飞书应用不存在") || message.contains("审核配置不存在") {
         ApiError::not_found(message)
-    } else if message.contains("飞书应用已停用") {
+    } else if message.contains("飞书应用已停用") || message.contains("尚未指定飞书应用")
+    {
         ApiError::conflict(message)
     } else {
         ApiError::internal(format!("{error:#}"))
@@ -3528,6 +3578,7 @@ mod tests {
     fn feishu_chat_list_query_only_accepts_official_values() {
         let params = build_chat_list_query(FeishuChatListQuery {
             project_id: None,
+            audit_config_id: None,
             user_id_type: Some("union_id".to_owned()),
             sort_type: Some("ByActiveTimeDesc".to_owned()),
             page_size: Some(100),
@@ -3572,6 +3623,7 @@ mod tests {
         for member_id_type in ["open_id", "user_id", "union_id"] {
             let params = build_chat_members_query(FeishuChatMembersQuery {
                 project_id: None,
+                audit_config_id: None,
                 member_id_type: Some(member_id_type.to_owned()),
                 page_size: Some(50),
                 page_token: None,
@@ -3581,6 +3633,15 @@ mod tests {
         }
         assert!(validate_feishu_chat_id("oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").is_ok());
         assert!(validate_feishu_chat_id("../../admin").is_err());
+    }
+
+    #[test]
+    fn feishu_chat_app_scope_is_unambiguous() {
+        assert!(validate_admin_lark_scope_ids(None, None).is_ok());
+        assert!(validate_admin_lark_scope_ids(Some(1), None).is_ok());
+        assert!(validate_admin_lark_scope_ids(None, Some(1)).is_ok());
+        assert!(validate_admin_lark_scope_ids(Some(1), Some(2)).is_err());
+        assert!(validate_admin_lark_scope_ids(None, Some(0)).is_err());
     }
 
     #[test]

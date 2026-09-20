@@ -699,8 +699,9 @@ GET /api/v1/admin/feishu/chats/{chat_id}/members
 ```
 
 两个接口使用服务端配置的飞书应用身份和 tenant access token；调用方只提供本系统的登录 JWT
-或管理员 Bearer Token，不传飞书 Token。默认应用管理员可省略 `project_id`；非默认应用必须传入
-拥有配置权限的 `project_id`，服务端会使用该项目绑定的飞书应用。响应会保留飞书官方的 HTTP 状态码以及完整 `code/data/msg`
+或管理员 Bearer Token，不传飞书 Token。可传 `project_id` 使用项目数据应用，或传 `audit_config_id`
+使用任意审核配置的通知应用，两者不能同时传。按审核配置查询仅允许默认应用管理员；非默认应用必须传入
+拥有配置权限的 `project_id`。响应会保留飞书官方的 HTTP 状态码以及完整 `code/data/msg`
 JSON 信封，不转换成项目自己的列表结构。每次请求只代理一页，下一页继续传入响应中的
 `page_token`，避免自动聚合改变官方分页语义。
 
@@ -714,6 +715,7 @@ curl "https://api.example.com/api/v1/admin/feishu/chats?project_id=1&user_id_typ
 | 参数 | 可选值/范围 | 说明 |
 | --- | --- | --- |
 | `project_id` | 正整数 | 默认应用管理员可省略；非默认应用必填且须拥有配置权限 |
+| `audit_config_id` | 正整数 | 使用审核配置中的飞书应用；仅默认应用管理员可用，不能与 `project_id` 同传 |
 | `user_id_type` | `open_id`、`union_id`、`user_id` | 返回群主 ID 的类型；不传时使用飞书默认值 |
 | `sort_type` | `ByCreateTimeAsc`、`ByActiveTimeDesc` | 创建时间升序或活跃时间降序 |
 | `page_size` | 1..100 | 飞书默认 20 |
@@ -726,7 +728,7 @@ curl "https://api.example.com/api/v1/admin/feishu/chats/oc_xxxxxxxxxxxxxxxx/memb
   -H "Authorization: Bearer $MUTATION_API_TOKEN"
 ```
 
-成员接口的 `member_id_type` 支持 `open_id`、`union_id`、`user_id`，还支持 `page_size` 和
+成员接口同样支持 `project_id` 或 `audit_config_id` 二选一；`member_id_type` 支持 `open_id`、`union_id`、`user_id`，还支持 `page_size` 和
 `page_token`。机器人必须已在目标群内；飞书不会在该接口中返回机器人成员。使用 `user_id`
 时还需要为应用开通相应的用户 ID 字段权限。部署前请在飞书开放平台开启机器人能力以及群信息/
 群成员读取权限。官方参考：[获取用户或机器人所在的群列表](https://open.feishu.cn/document/server-docs/group/chat/list)、
@@ -870,7 +872,7 @@ Content-Type: application/json
 
 审核通知应用只负责发送卡片，待审核数据仍由项目数据处理应用读取，因此通知应用不需要访问项目多维表格。通知方案必须属于所选审核配置，数据库复合外键和绑定接口都会校验该约束。共享配置的修改会影响所有绑定项目，所以配置及绑定接口仅允许默认应用管理员调用。旧的 `audit-notice-feishu-app`、项目通知和项目审核员接口保留兼容，并同步修改当前绑定配置；新管理端应使用审核配置接口。
 
-管理类飞书接口可增加 `project_id` 查询参数，以指定应用身份：群列表、群成员、多维表数据表枚举。
+群列表和群成员接口可增加 `project_id` 或 `audit_config_id` 查询参数指定应用身份；多维表数据表枚举继续使用 `project_id`。
 电子表格格式化接口则在 JSON 请求体中增加可选 `project_id`。不传时均使用全局兜底应用。
 
 `GET /projects/{project_id}` 会同时返回 `feishu_app`、`audit_notice_feishu_app`、`audit_config_binding`、`notification`、
